@@ -1,4 +1,5 @@
 name: Regression tests
+run-name: Regression ${{ inputs.project_id }} ${{ inputs.request_id }}
 
 on:
   workflow_dispatch:
@@ -14,6 +15,10 @@ on:
       modules:
         description: Comma-separated test folders (for example sanity/login,regression)
         required: true
+        type: string
+      request_id:
+        description: Unique ID from the caller, used to find this run via API
+        required: false
         type: string
 
 jobs:
@@ -52,11 +57,40 @@ jobs:
         shell: bash
         env:
           MODULES: ${{ inputs.modules }}
+          PLAYWRIGHT_HTML_OPEN: never
+          PLAYWRIGHT_JUNIT_OUTPUT_NAME: reports/junit.xml
+          PLAYWRIGHT_JSON_OUTPUT_NAME: reports/results.json
         run: |
+          mkdir -p reports
           args=()
           IFS=',' read -ra folders <<< "$MODULES"
           for folder in "${folders[@]}"; do
             folder="$(echo "$folder" | xargs)"
             [[ -n "$folder" ]] && args+=("$folder")
           done
-          npx playwright test "${args[@]}"
+          npx playwright test "${args[@]}" --reporter=html,junit,json,list
+
+      - name: Upload HTML report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-html-report
+          path: playwright-report/
+          retention-days: 14
+
+      - name: Upload JUnit/JSON results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: reports/
+          retention-days: 14
+
+      - name: Upload traces/screenshots/videos
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
