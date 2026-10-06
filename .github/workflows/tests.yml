@@ -1,0 +1,41 @@
+name: Regression tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: Project identifier
+        required: false
+        type: string
+      service_type:
+        description: Automation type
+        required: false
+        type: string
+      modules:
+        description: Comma-separated test folders (for example sanity/login,regression)
+        required: true
+        type: string
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Run selected modules
+        shell: bash
+        env:
+          MODULES: ${{ inputs.modules }}
+        run: |
+          args=()
+          IFS=',' read -ra folders <<< "$MODULES"
+          for folder in "${folders[@]}"; do
+            folder="$(echo "$folder" | xargs)"
+            [[ -n "$folder" ]] && args+=("$folder")
+          done
+          npx playwright test "${args[@]}"
