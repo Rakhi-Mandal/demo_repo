@@ -16,8 +16,12 @@ on:
         description: Comma-separated test folders (for example sanity/login,regression)
         required: true
         type: string
+      browsers:
+        description: Comma-separated Playwright projects (chromium,firefox,webkit)
+        required: true
+        type: string
       request_id:
-        description: Unique ID from the caller, used to find this run via API
+        description: Unique ID from the dashboard request
         required: false
         type: string
 
@@ -43,31 +47,56 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}-${{ inputs.browsers }}
 
-      - name: Install Playwright browsers
+      - name: Install selected Playwright browsers
         if: steps.pw-cache.outputs.cache-hit != 'true'
-        run: npx playwright install --with-deps
+        shell: bash
+        env:
+          BROWSERS: ${{ inputs.browsers }}
+        run: |
+          IFS=',' read -ra browsers <<< "$BROWSERS"
+          for browser in "${browsers[@]}"; do
+            browser="$(echo "$browser" | xargs)"
+            [[ -n "$browser" ]] && npx playwright install --with-deps "$browser"
+          done
 
-      - name: Install Playwright system deps (cache hit)
+      - name: Install system dependencies for selected browsers
         if: steps.pw-cache.outputs.cache-hit == 'true'
-        run: npx playwright install-deps
+        shell: bash
+        env:
+          BROWSERS: ${{ inputs.browsers }}
+        run: |
+          IFS=',' read -ra browsers <<< "$BROWSERS"
+          for browser in "${browsers[@]}"; do
+            browser="$(echo "$browser" | xargs)"
+            [[ -n "$browser" ]] && npx playwright install-deps "$browser"
+          done
 
-      - name: Run selected modules
+      - name: Run selected modules and browsers
         shell: bash
         env:
           MODULES: ${{ inputs.modules }}
+          BROWSERS: ${{ inputs.browsers }}
           PLAYWRIGHT_HTML_OPEN: never
           PLAYWRIGHT_JUNIT_OUTPUT_NAME: reports/junit.xml
           PLAYWRIGHT_JSON_OUTPUT_NAME: reports/results.json
         run: |
           mkdir -p reports
           args=()
+
           IFS=',' read -ra folders <<< "$MODULES"
           for folder in "${folders[@]}"; do
             folder="$(echo "$folder" | xargs)"
             [[ -n "$folder" ]] && args+=("$folder")
           done
+
+          IFS=',' read -ra browsers <<< "$BROWSERS"
+          for browser in "${browsers[@]}"; do
+            browser="$(echo "$browser" | xargs)"
+            [[ -n "$browser" ]] && args+=("--project=$browser")
+          done
+
           npx playwright test "${args[@]}" --reporter=html,junit,json,list
 
       - name: Upload HTML report
@@ -76,21 +105,23 @@ jobs:
         with:
           name: playwright-html-report
           path: playwright-report/
+          if-no-files-found: ignore
           retention-days: 14
 
-      - name: Upload JUnit/JSON results
+      - name: Upload JUnit and JSON results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: playwright-results
           path: reports/
+          if-no-files-found: ignore
           retention-days: 14
 
-      - name: Upload traces/screenshots/videos
+      - name: Upload traces, screenshots, and videos
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: playwright-test-results
           path: test-results/
-          retention-days: 7
           if-no-files-found: ignore
+          retention-days: 7

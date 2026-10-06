@@ -8,6 +8,7 @@ module.exports = defineConfig({
   expect: {
     timeout: 1200000         
   },
+  outputDir: 'test-results',
   reporter: [
     ['line'],
     ['json', { outputFile: 'test-results/report.json' }],
