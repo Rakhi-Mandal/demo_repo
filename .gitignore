@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Playwright outputs
+test-results/
+playwright-report/
+
+# Allure outputs
+allure-results/
+allure-report/
+
+# Local environment
+.env
