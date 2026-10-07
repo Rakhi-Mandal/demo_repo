@@ -405,11 +405,27 @@ function isPreambleLine(line) {
   return false;
 }
 
+// Comments written above the imports (a generator note, a header someone added)
+// are kept, but they must not stop the scan: the imports below them still have
+// to go, or the canonical header declares `test` a second time.
 function stripSpecPreamble(source) {
   const lines = String(source || '').replace(/^\uFEFF/, '').split(/\r?\n/);
+  const comments = [];
   let index = 0;
-  while (index < lines.length && isPreambleLine(lines[index])) index += 1;
-  return lines.slice(index).join('\n').replace(/^\s+/, '');
+  while (index < lines.length) {
+    if (isPreambleLine(lines[index])) { index += 1; continue; }
+    const text = lines[index].trim();
+    if (text.startsWith('//')) { comments.push(lines[index]); index += 1; continue; }
+    if (!text.startsWith('/*')) break;
+    let end = index;
+    while (end < lines.length && !lines[end].includes('*/', end === index ? lines[end].indexOf('/*') + 2 : 0)) end += 1;
+    // An unclosed comment, or code after the closing */, is left to the body untouched.
+    if (end >= lines.length || lines[end].slice(lines[end].lastIndexOf('*/') + 2).trim()) break;
+    comments.push(...lines.slice(index, end + 1));
+    index = end + 1;
+  }
+  const body = lines.slice(index).join('\n').replace(/^\s+/, '');
+  return comments.length ? `${comments.join('\n')}\n\n${body}` : body;
 }
 
 function looksLikeHealWrapped(source) {
@@ -417,11 +433,26 @@ function looksLikeHealWrapped(source) {
     || /\bheal\s*\(\s*(?:page|[\w$.]+)\s*,/.test(source);
 }
 
+// A spec that declares its own top-level testData (an inline object instead of
+// test-data.json) must not also get the shared import: that is a second
+// declaration of the same name and the copy no longer parses.
+function declaresOwnTestData(body) {
+  try {
+    const program = require('@babel/parser').parse(body, { sourceType: 'unambiguous', errorRecovery: true, plugins: ['jsx'] }).program;
+    return program.body.some(node =>
+      (node.type === 'VariableDeclaration' && node.declarations.some(d => d.id && d.id.type === 'Identifier' && d.id.name === 'testData'))
+      || ((node.type === 'FunctionDeclaration' || node.type === 'ClassDeclaration') && node.id && node.id.name === 'testData')
+      || (node.type === 'ImportDeclaration' && node.specifiers.some(s => s.local && s.local.name === 'testData')));
+  } catch (_) {
+    return /(^|\n)(?:const|let|var)\s+testData\b/.test(body);
+  }
+}
+
 function installCanonicalHealedHeader(body, fixtureModule, testDataModule) {
   const trimmed = stripSpecPreamble(body);
   return [
     `const { test, expect } = require(${jsString(fixtureModule)});`,
-    `import testData from ${jsString(testDataModule)};`,
+    ...(declaresOwnTestData(trimmed) ? [] : [`import testData from ${jsString(testDataModule)};`]),
     '',
     trimmed,
   ].join('\n').replace(/\s+$/, '') + '\n';
@@ -430,7 +461,7 @@ function installCanonicalHealedHeader(body, fixtureModule, testDataModule) {
 function installCanonicalSourceHeader(body, testDataModule) {
   const trimmed = stripSpecPreamble(body);
   return [
-    `import testData from ${jsString(testDataModule)};`,
+    ...(declaresOwnTestData(trimmed) ? [] : [`import testData from ${jsString(testDataModule)};`]),
     `import { test, expect } from '@playwright/test';`,
     '',
     trimmed,
@@ -514,12 +545,13 @@ function syncSourceFromHealed(healedFile, options = {}) {
         throw new Error('Source spec does not exist for reverse test-body sync: ' + sourceFile);
       }
       const copied = copyTestBodies(healedContent, currentSource, file, sourceFile, healedDirectory, sourceDirectory);
-      if (!copied.updated) {
+      const nextSource = matchLineEndings(copied.content, currentSource);
+      if (!copied.updated || nextSource === currentSource) {
         removeSyncSidecar(file);
         return { updated: false, sourceFile, outputFile: file };
       }
       fs.mkdirSync(sourceDirectory, { recursive: true });
-      writeAtomic(sourceFile, copied.content);
+      writeAtomic(sourceFile, nextSource);
       removeSyncSidecar(file);
       console.log('[healed-sync] ' + sourceFile + ' <- ' + file + ' (test body only)');
       return { updated: true, sourceFile, outputFile: file };
@@ -657,6 +689,16 @@ function mergeMirrorRepairs(base, current, next, file) {
   return { content: result, preserved: edits.length, dropped };
 }
 
+// Rewrites keep the line endings the file already has. Test bodies copied in
+// from the other file of the pair otherwise arrive with that file's endings, and
+// a CRLF spec (Windows checkout) turns into mixed CRLF/LF on every sync.
+function matchLineEndings(content, existing) {
+  if (existing == null || existing === '') return content;
+  const crlf = (existing.match(/\r\n/g) || []).length;
+  const lf = (existing.match(/\n/g) || []).length - crlf;
+  return String(content).replace(/\r?\n/g, crlf > lf ? '\r\n' : '\n');
+}
+
 function writeAtomic(file, content) {
   const temporary = file + '.sync-' + crypto.randomBytes(8).toString('hex') + '.tmp';
   let created = false;
@@ -708,6 +750,7 @@ function syncMirrorFile(sourceFile, outputFile, next) {
       merged = { content: next, preserved: 0, dropped: 0 };
     }
   } else parseSyncSource(next, outputFile);
+  merged = { ...merged, content: matchLineEndings(merged.content, current) };
   if (current === merged.content) {
     removeSyncSidecar(outputFile);
     return { updated: false, ...merged };
@@ -1063,10 +1106,11 @@ function prepareHealedSpec(sourceFile, options = {}) {
     if (fs.existsSync(outputFile)) {
       const currentHealed = fs.readFileSync(outputFile, 'utf8');
       const copied = copyTestBodies(original, currentHealed, absoluteSource, outputFile, sourceDirectory, outputDirectory);
-      if (!copied.updated) {
+      const nextHealed = matchLineEndings(copied.content, currentHealed);
+      if (!copied.updated || nextHealed === currentHealed) {
         sync = { updated: false, deferred: false, preserved: 0, dropped: 0 };
       } else {
-        writeAtomic(outputFile, copied.content);
+        writeAtomic(outputFile, nextHealed);
         removeSyncSidecar(outputFile);
         sync = { updated: true, deferred: false, preserved: 0, dropped: 0 };
         console.log('[healed-sync] ' + outputFile + ' <- ' + absoluteSource + ' (test body only)');
