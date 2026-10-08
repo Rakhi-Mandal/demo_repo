@@ -1,0 +1,72 @@
+image: node:20
+
+pipelines:
+  custom:
+    Regression tests:
+      - variables:
+          - name: PROJECT_ID
+          - name: SERVICE_TYPE
+          - name: MODULES
+            default: sanity
+          - name: BROWSERS
+            default: chromium
+      - step:
+          name: Run selected Playwright modules
+          caches:
+            - node
+          script:
+            - apt-get update && apt-get install -y --no-install-recommends zip curl openjdk-17-jre-headless
+            - npm ci
+            - mkdir -p reports
+            - |
+              IFS=',' read -ra browsers <<< "$BROWSERS"
+              for browser in "${browsers[@]}"; do
+                browser="$(echo "$browser" | xargs)"
+                case "$browser" in
+                  chromium) npx playwright install --with-deps chrome ;;
+                  msedge) npx playwright install --with-deps msedge ;;
+                  firefox|webkit) npx playwright install --with-deps "$browser" ;;
+                  *) echo "Unsupported browser project: $browser" >&2; exit 1 ;;
+                esac
+              done
+              args=()
+              IFS=',' read -ra folders <<< "$MODULES"
+              for folder in "${folders[@]}"; do
+                folder="$(echo "$folder" | xargs)"
+                [[ -n "$folder" ]] && args+=("$folder")
+              done
+              IFS=',' read -ra browsers <<< "$BROWSERS"
+              for browser in "${browsers[@]}"; do
+                browser="$(echo "$browser" | xargs)"
+                [[ -n "$browser" ]] && args+=("--project=$browser")
+              done
+              set +e
+              npx playwright test "${args[@]}"
+              test_status=$?
+              set -e
+              if [ -d allure-results ] && find allure-results -type f -print -quit | grep -q .; then
+                npx --yes allure-commandline@2 generate allure-results --clean -o allure-report || true
+              fi
+              build_tag=${BITBUCKET_BUILD_NUMBER:-local}
+              [ -d playwright-report ] && zip -qr "reports/playwright-html-report-$build_tag.zip" playwright-report || true
+              [ -d allure-report ] && zip -qr "reports/allure-html-report-$build_tag.zip" allure-report || true
+              [ -d allure-results ] && zip -qr "reports/allure-results-$build_tag.zip" allure-results || true
+              if [ -n "$BITBUCKET_EMAIL" ] && [ -n "$BITBUCKET_API_TOKEN" ]; then
+                upload_args=()
+                for archive in reports/*.zip; do
+                  [ -f "$archive" ] && upload_args+=(-F "files=@$archive")
+                done
+                if [ ${#upload_args[@]} -gt 0 ]; then
+                  if ! curl --fail-with-body --silent --show-error --user "$BITBUCKET_EMAIL:$BITBUCKET_API_TOKEN" "${upload_args[@]}" "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/downloads"; then
+                    echo "Report upload failed. Check the secured Bitbucket variables and repository write scope."
+                  fi
+                fi
+              else
+                echo "Report archives kept as pipeline artifacts. Set secured BITBUCKET_EMAIL and BITBUCKET_API_TOKEN repository variables to publish them for dashboard viewing."
+              fi
+              exit "$test_status"
+          artifacts:
+            - playwright-report/**
+            - allure-results/**
+            - allure-report/**
+            - reports/**
