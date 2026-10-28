@@ -1,5 +1,5 @@
-import { test, expect } from '@playwright/test';
-import testData from '../test-data.json';
+const { test, expect } = require('../../../fixtures/walker_fixture.js');
+import testData from '../../../test-data.json';
 
 test("sign in with email button and focus inputs @sanity", async ({ page }) => {
   await page.goto(testData.url);
