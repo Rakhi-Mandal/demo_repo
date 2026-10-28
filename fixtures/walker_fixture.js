@@ -265,6 +265,17 @@ function healEvidenceOf(testInfo) {
             askedToSee: Array.isArray(look.asked_to_see) ? look.asked_to_see.length : 0,
             shown: (Array.isArray(look.tiles) ? look.tiles : []).filter(tile => tile.kind === 'hidden' && tile.status === 'shown').length,
           })),
+          // Counts only, per pass: what the model got of the requested kind -
+          // numbered in the picture, outside the picture (close-up), not shown
+          // because the step cannot use them (listed with why), and without any
+          // box (counted only). Nothing of that kind is dropped unseen.
+          candidates: (Array.isArray(summary.candidate_counts) ? summary.candidate_counts : []).map(count => ({
+            pass: count.pass || null,
+            numbered: Number(count.numbered) || 0,
+            outsidePicture: Number(count.outside_picture) || 0,
+            notShown: Number(count.not_shown) || 0,
+            noBox: Number(count.no_box) || 0,
+          })),
         });
       } catch (_) {}
       continue;

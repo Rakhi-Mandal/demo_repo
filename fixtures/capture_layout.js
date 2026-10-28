@@ -605,4 +605,117 @@ async function waitForCaptureStability(page, options = {}) {
   return { stable: true };
 }
 
-module.exports = { prepareCaptureLayout, expandRenderedScrollContainers, waitForCaptureStability, inspectCaptureSurface, readCaptureGeometry };
+// First (filtered) pass only - measured in the page's own layout, before any
+// capture expansion, because that is the layout the real action runs in.
+// For each element, asks the browser two things and remembers the answers for
+// browser_script.js (window.__PW_HEAL_REACH__):
+//   box     - does it have a box? Its own, or else the boxes of its text and
+//             children together (an element with display:contents has none of
+//             its own while its content shows).
+//   blocked - for a pointer action: can the action reach it at all? A box fixed
+//             to the window (or in the top layer) that covers the WHOLE window
+//             blocks everything outside it at every scroll position; inside the
+//             window, whatever is on top at the element's points must be the
+//             element or part of it, unless that is pinned content (a sticky or
+//             fixed header) that scrolling can move it out from under.
+// Running animations (a pop-up still sliding in) are let finish first.
+async function measureCandidateReach(options = {}) {
+  delete window.__PW_HEAL_REACH__;
+  try {
+    const running = document.getAnimations().filter(animation => animation.playState === 'running' &&
+      Number.isFinite(animation.effect?.getComputedTiming?.().endTime));
+    if (running.length) {
+      await Promise.race([
+        Promise.all(running.map(animation => animation.finished.catch(() => {}))),
+        new Promise(resolve => setTimeout(resolve, options.animationTimeout || 2000)),
+      ]);
+    }
+  } catch (_) {}
+  const parent = element => element.parentElement || element.getRootNode()?.host || null;
+  const within = (outer, inner) => { for (let node = inner; node; node = parent(node)) if (node === outer) return true; return false; };
+  const describe = node => node ? `<${node.localName}${node.id ? `#${node.id}` : ''}${node.getAttribute?.('class') ? ` class="${String(node.getAttribute('class')).trim().slice(0, 60)}"` : ''}>` : 'nothing';
+  const topAt = (x, y) => {
+    let hit = document.elementFromPoint(x, y);
+    while (hit?.shadowRoot) {
+      const inner = hit.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === hit) break;
+      hit = inner;
+    }
+    return hit;
+  };
+  // Content that does not scroll with the page: fixed, sticky, or in the top layer.
+  const pinnedRoot = node => {
+    for (let current = node; current; current = parent(current)) {
+      if (current.nodeType !== 1) continue;
+      let topLayer = false;
+      try { topLayer = (current.localName === 'dialog' && current.matches(':modal')) || (current.hasAttribute('popover') && current.matches(':popover-open')); } catch (_) {}
+      const position = getComputedStyle(current).position;
+      if (topLayer || position === 'fixed' || position === 'sticky') return current;
+    }
+    return null;
+  };
+  const boxOf = element => {
+    const own = element.getBoundingClientRect();
+    if (own.width >= 1 && own.height >= 1) return own;
+    const range = document.createRange();
+    try {
+      range.selectNodeContents(element);
+      const parts = [...range.getClientRects()].filter(box => box.width >= 1 && box.height >= 1);
+      if (!parts.length) return null;
+      const left = Math.min(...parts.map(box => box.left)), top = Math.min(...parts.map(box => box.top));
+      const right = Math.max(...parts.map(box => box.right)), bottom = Math.max(...parts.map(box => box.bottom));
+      return { left, top, right, bottom, width: right - left, height: bottom - top };
+    } finally { range.detach(); }
+  };
+  const elements = [];
+  const visit = root => {
+    for (const element of root.querySelectorAll('*')) {
+      if (!options.tag || element.localName === options.tag) elements.push(element);
+      if (element.shadowRoot) visit(element.shadowRoot);
+    }
+  };
+  visit(document);
+  const pointer = ['click', 'dblclick', 'tap', 'check', 'uncheck', 'hover', 'setchecked', 'dragto'].includes(String(options.action || '').toLowerCase());
+  const W = innerWidth, H = innerHeight, N = 9;
+  let windowCovered = pointer;
+  const covers = new Set();
+  for (let i = 0; i < N && windowCovered; i += 1) {
+    for (let j = 0; j < N; j += 1) {
+      const root = pinnedRoot(topAt((i + 0.5) * W / N, (j + 0.5) * H / N));
+      if (!root || getComputedStyle(root).position === 'sticky') { windowCovered = false; break; }
+      covers.add(root);
+    }
+  }
+  const coverRoots = windowCovered ? [...covers] : [];
+  const reach = new WeakMap();
+  let noBox = 0, blockedCount = 0;
+  for (const element of elements) {
+    const box = boxOf(element);
+    let invisible = false;
+    try { invisible = !element.checkVisibility({ opacityProperty: true, visibilityProperty: true }); } catch (_) {}
+    let blocked = null;
+    if (box && pointer) {
+      if (element.disabled || element.getAttribute('aria-disabled') === 'true' || element.closest?.('[inert],fieldset:disabled')) {
+        blocked = 'it is disabled';
+      } else if (windowCovered && !coverRoots.some(root => within(root, element))) {
+        blocked = `${coverRoots.map(describe).join(' and ')} covers the whole window, and it is not inside that`;
+      } else if (box.right > 0 && box.bottom > 0 && box.left < W && box.top < H) {
+        const x = Math.min(Math.max((box.left + box.right) / 2, 1), W - 1), y = Math.min(Math.max((box.top + box.bottom) / 2, 1), H - 1);
+        const points = [[x, y], [box.left + 3, box.top + 3], [box.right - 3, box.top + 3], [box.left + 3, box.bottom - 3], [box.right - 3, box.bottom - 3]]
+          .filter(([px, py]) => px > 0 && py > 0 && px < W && py < H);
+        const hits = points.map(([px, py]) => topAt(px, py));
+        // Covered at every point by something that scrolls with it: no scrolling can help.
+        if (!hits.some(hit => hit && within(element, hit)) && hits[0] && !pinnedRoot(hits[0])) {
+          blocked = `it is covered by ${describe(hits[0])}`;
+        }
+      }
+    }
+    if (!box) noBox += 1;
+    if (blocked) blockedCount += 1;
+    reach.set(element, { box: Boolean(box), blocked, invisible });
+  }
+  window.__PW_HEAL_REACH__ = { version: 1, pointer, get: element => reach.get(element) || null };
+  return { measured: elements.length, pointer, windowCovered, coveredBy: coverRoots.map(describe), noBox, blocked: blockedCount };
+}
+
+module.exports = { prepareCaptureLayout, expandRenderedScrollContainers, waitForCaptureStability, inspectCaptureSurface, readCaptureGeometry, measureCandidateReach };

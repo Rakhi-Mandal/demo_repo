@@ -11,3 +11,9 @@ allure-report/
 
 # Local environment
 .env
+
+# Healer runtime files
+*.healing.lock
+*.running-*.lock
+*.sync-*.tmp
+fixtures/framework_location.json

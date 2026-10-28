@@ -2648,6 +2648,15 @@ function isAllowedStructuralClickXPath(
   const exactNameWords = new Set(Array.isArray(options.exactNameWords) ? options.exactNameWords.filter(word => typeof word === 'string' && word) : []);
   const targetIntent = options.targetIntent || { kind: 'any' };
   const broadDom = targetIntent.kind === 'all-dom';
+  // First (filtered) pass only - the final all-DOM pass is left exactly as it was.
+  // Elements of the requested kind that are not shown are listed with why
+  // (never dropped without a word); the best this many are described.
+  const collectNotDrawn = options.collectNotDrawn === true && !broadDom;
+  const maxNotDrawn = Math.max(0, Number(options.maxNotDrawn) || 0) || 400;
+  // What the browser measured before capture, in the page's own layout
+  // (capture_layout.js measureCandidateReach): has a box, and can the step's
+  // pointer action reach it. Absent: the first pass works as before.
+  const reachInfo = !broadDom && window.__PW_HEAL_REACH__?.version === 1 ? window.__PW_HEAL_REACH__ : null;
   const hasExplicitTargetType = ['tag', 'role', 'text', 'attributes', 'labelled', 'all-dom'].includes(targetIntent.kind);
   const customRules = Array.isArray(options.mappingRules) ? options.mappingRules : [];
   const roleSnapshot = window.__PW_HEAL_ROLE_TARGETS__;
@@ -2858,26 +2867,74 @@ function isAllowedStructuralClickXPath(
     return { top: box.top + top, right: box.left + right, bottom: box.top + bottom, left: box.left + left };
   }
 
-  function clipRenderedRect(element, rect, includeSelfClip = false, viewportOnly = false) {
+  // ---- Which boxes can cut an element off --------------------------------
+  // A box's overflow clips only the elements it contains in the CSS sense
+  // (its containing-block chain), not everything nested inside it in the DOM.
+  // A position:fixed element - a pop-up, a drawer - escapes every box above
+  // it until one that contains fixed elements (a transform, filter, contain,
+  // ...); a position:absolute one escapes boxes until its nearest positioned
+  // one; a modal <dialog>, an open popover or the fullscreen element sits in
+  // the browser's top layer, where no box above it clips it.
+  function containsFixedDescendants(style) {
+    const set = value => Boolean(value) && value !== 'none';
+    return set(style.transform) || set(style.translate) || set(style.rotate) || set(style.scale) ||
+      set(style.perspective) || set(style.filter) || set(style.backdropFilter || style.webkitBackdropFilter) ||
+      /\b(?:layout|paint|strict|content)\b/.test(style.contain || '') ||
+      /\b(?:transform|translate|rotate|scale|perspective|filter|backdrop-filter|contain)\b/.test(style.willChange || '') ||
+      Boolean(style.containerType && style.containerType !== 'normal') ||
+      style.contentVisibility === 'auto' || set(style.offsetPath);
+  }
+  function inTopLayer(element) {
     try {
-      if (!element.isConnected || toolingNode(element) || window.__PW_HEAL_CAPTURE_VISIBILITY__?.isExcluded(element)) return null;
+      if (element.localName === 'dialog' && element.matches(':modal')) return true;
+      if (element.hasAttribute('popover') && element.matches(':popover-open')) return true;
+    } catch (_) {}
+    return element === document.fullscreenElement;
+  }
+  // How the box just below an ancestor is positioned: 'flow' (static,
+  // relative, sticky), 'absolute', 'fixed' or 'top' (top layer).
+  function positioning(element, style) {
+    if (inTopLayer(element)) return 'top';
+    if (style.position === 'fixed') return 'fixed';
+    return style.position === 'absolute' ? 'absolute' : 'flow';
+  }
+  // Is this ancestor on the containing-block chain of a box positioned so?
+  function onContainingChain(mode, style) {
+    if (style.display === 'contents' || mode === 'top') return false;
+    if (mode === 'flow') return true;
+    if (containsFixedDescendants(style)) return true;
+    return mode === 'absolute' && style.position !== 'static';
+  }
+
+  // `measured`: the first pass, where the browser already said (before capture,
+  // __PW_HEAL_REACH__) that the element has a box and can be reached; then only
+  // where its box lies in the picture is decided here, not CSS paint rules.
+  // The final all-DOM pass (broadDom) keeps its original rules unchanged: every
+  // overflow ancestor clips.
+  function clipRenderedRect(element, rect, includeSelfClip = false, viewportOnly = false, measured = false) {
+    try {
+      if (!element.isConnected || toolingNode(element) || (!measured && window.__PW_HEAL_CAPTURE_VISIBILITY__?.isExcluded(element))) return null;
       if (!rect) return null;
       if (rect.width < 1 || rect.height < 1) return null;
       let left = rect.left, right = rect.right, top = rect.top, bottom = rect.bottom;
       let current = element;
+      let mode = 'flow';
       while (current && current.nodeType === 1) {
         const style = getComputedStyle(current);
-        if (style.display === 'none' || Number(style.opacity) === 0 || style.contentVisibility === 'hidden' ||
-            (current === element && ['hidden', 'collapse'].includes(style.visibility))) return null;
+        if (style.display === 'none' || style.contentVisibility === 'hidden' ||
+            (!measured && (Number(style.opacity) === 0 || (current === element && ['hidden', 'collapse'].includes(style.visibility))))) return null;
         const explicit = explicitClip(current, style);
         if (explicit) {
           left = Math.max(left, explicit.left); right = Math.min(right, explicit.right);
           top = Math.max(top, explicit.top); bottom = Math.min(bottom, explicit.bottom);
           if (right - left <= 1 || bottom - top <= 1) return null;
         }
+        const own = current === element;
+        const contains = own || broadDom || onContainingChain(mode, style);
+        if (contains) mode = positioning(current, style);
         // Full-page capture reveals the outer document, not content hidden
         // inside an independently scrolling/clipped panel.
-        if (style.display !== 'contents' && (includeSelfClip || current !== element) && current !== document.body && current !== document.documentElement) {
+        if (contains && style.display !== 'contents' && (includeSelfClip || !own) && current !== document.body && current !== document.documentElement) {
           const clip = current.getBoundingClientRect();
           if (/^(?:hidden|clip|auto|scroll)$/.test(style.overflowX)) {
             left = Math.max(left, clip.left); right = Math.min(right, clip.right);
@@ -2906,10 +2963,29 @@ function isAllowedStructuralClickXPath(
     }
   }
 
+  // The boxes of an element's text and children together, for an element with
+  // no box of its own whose content still shows (display:contents, a 0-height
+  // wrapper with visible overflow).
+  function contentRect(element) {
+    const range = document.createRange();
+    try {
+      range.selectNodeContents(element);
+      const parts = Array.from(range.getClientRects()).filter(box => box.width >= 1 && box.height >= 1);
+      if (!parts.length) return null;
+      const left = Math.min(...parts.map(box => box.left)), top = Math.min(...parts.map(box => box.top));
+      const right = Math.max(...parts.map(box => box.right)), bottom = Math.max(...parts.map(box => box.bottom));
+      return { left, top, right, bottom, width: right - left, height: bottom - top };
+    } catch (_) {
+      return null;
+    } finally { range.detach(); }
+  }
+
   function visibleRect(element) {
+    const measured = Boolean(!broadDom && reachInfo?.get(element));
     let rect = targetIntent.kind === 'text' ? textRect(element) : element.getBoundingClientRect();
     if (broadDom && (!rect || rect.width < 1 || rect.height < 1)) rect = textRect(element);
-    return clipRenderedRect(element, rect);
+    else if (measured && targetIntent.kind !== 'text' && (!rect || rect.width < 1 || rect.height < 1)) rect = contentRect(element);
+    return clipRenderedRect(element, rect, false, false, measured);
   }
 
   // Keep each rendered text fragment, including text directly owned by a
@@ -3109,33 +3185,42 @@ function isAllowedStructuralClickXPath(
     return openModals;
   }
   // The scrolling that would bring an element outside the picture into view
-  // (innermost panel first, then the page), or null when scrolling cannot:
-  // hidden by CSS, cut off by a box the user cannot scroll (overflow
-  // hidden/clip, or a box too small to show anything), pinned outside the
-  // window, beyond what can be scrolled to, behind an open modal, or inert.
+  // (innermost panel first, then the page) as { steps }, or { why } when
+  // scrolling cannot: hidden by CSS, cut off by a box the user cannot scroll
+  // (overflow hidden/clip, or a box too small to show anything), pinned
+  // outside the window, beyond what can be scrolled to, behind an open modal,
+  // or inert. Only the boxes that contain the element in the CSS sense count
+  // (onContainingChain): a fixed pop-up does not scroll with the page panel
+  // it is nested in, and is not cut off by it.
   function scrollReach(element, rect) {
+    const unreachable = why => ({ why });
     try {
-      if (!rect || rect.width < 1 || rect.height < 1 || !element.isConnected) return null;
-      if (window.__PW_HEAL_CAPTURE_VISIBILITY__?.isExcluded(element)) return null;
-      for (let node = element; node; node = hostParent(node)) if (node.nodeType === 1 && node.hasAttribute('inert')) return null;
+      if (!rect || rect.width < 1 || rect.height < 1 || !element.isConnected) return unreachable('no-size');
+      if (window.__PW_HEAL_CAPTURE_VISIBILITY__?.isExcluded(element)) return unreachable('hidden-before-capture');
+      for (let node = element; node; node = hostParent(node)) if (node.nodeType === 1 && node.hasAttribute('inert')) return unreachable('inert');
       const modals = modalsOpen();
-      if (modals.length && !modals.some(modal => within(modal, element))) return null;
+      if (modals.length && !modals.some(modal => within(modal, element))) return unreachable('outside-open-modal');
       const box = { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
       const AXES = [['x', 'left', 'right'], ['y', 'top', 'bottom']];
       const steps = [];
-      let pinned = false;
+      let mode = 'flow';
+      let anyFixed = false;
       for (let current = element; current && current.nodeType === 1; current = hostParent(current)) {
         const style = getComputedStyle(current);
         if (style.display === 'none' || Number(style.opacity) === 0 || style.contentVisibility === 'hidden' ||
-            (current === element && ['hidden', 'collapse'].includes(style.visibility))) return null;
+            (current === element && ['hidden', 'collapse'].includes(style.visibility))) return unreachable('hidden-by-css');
         const explicit = explicitClip(current, style);
         if (explicit) {
           box.left = Math.max(box.left, explicit.left); box.right = Math.min(box.right, explicit.right);
           box.top = Math.max(box.top, explicit.top); box.bottom = Math.min(box.bottom, explicit.bottom);
-          if (box.right - box.left <= 1 || box.bottom - box.top <= 1) return null;
+          if (box.right - box.left <= 1 || box.bottom - box.top <= 1) return unreachable('cut-away-by-clip');
         }
-        if (style.position === 'fixed') pinned = true;
-        if (current === element || style.display === 'contents' || current === document.body || current === document.documentElement) continue;
+        if (style.position === 'fixed') anyFixed = true;
+        const own = current === element;
+        // The final all-DOM pass keeps its original rule: every overflow ancestor counts.
+        const contains = own || broadDom || onContainingChain(mode, style);
+        if (contains) mode = positioning(current, style);
+        if (own || !contains || style.display === 'contents' || current === document.body || current === document.documentElement) continue;
         const clip = current.getBoundingClientRect();
         for (const [axis, lo, hi] of AXES) {
           const overflow = axis === 'x' ? style.overflowX : style.overflowY;
@@ -3147,11 +3232,11 @@ function isAllowedStructuralClickXPath(
           // Wholly outside this box on this axis: only scrolling the box
           // brings it in, and only a box the user can scroll counts.
           const size = axis === 'x' ? current.clientWidth : current.clientHeight;
-          if (!/^(?:auto|scroll)$/.test(overflow) || size < 16) return null;
+          if (!/^(?:auto|scroll)$/.test(overflow) || size < 16) return unreachable('cut-off-not-scrollable');
           if (!(axis === 'x' && style.direction === 'rtl')) {
             const start = clip[lo] + (axis === 'x' ? current.clientLeft - current.scrollLeft : current.clientTop - current.scrollTop);
             const end = start + (axis === 'x' ? current.scrollWidth : current.scrollHeight);
-            if (box[hi] <= start + 0.5 || box[lo] >= end - 0.5) return null;
+            if (box[hi] <= start + 0.5 || box[lo] >= end - 0.5) return unreachable('beyond-scroll-range');
           }
           const after = box[lo] >= clip[hi];
           steps.push({ scope: 'panel', panel: current, axis, after,
@@ -3161,6 +3246,9 @@ function isAllowedStructuralClickXPath(
           box[lo] = clip[lo]; box[hi] = clip[lo] + length;
         }
       }
+      // Pinned to the window: nothing above it contains it but the viewport
+      // (the all-DOM pass keeps its original rule: any fixed ancestor).
+      const pinned = broadDom ? anyFixed : (mode === 'fixed' || mode === 'top');
       const documentWidth = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0, innerWidth);
       const documentHeight = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0, innerHeight);
       for (const [axis, lo, hi] of AXES) {
@@ -3171,15 +3259,16 @@ function isAllowedStructuralClickXPath(
         // Outside the captured area, so the page itself would have to scroll.
         // Content pinned to the window does not move with it, and nothing
         // scrolls beyond the document.
-        if (fullPage || pinned) return null;
-        if (box[hi] <= start + 0.5 || box[lo] >= end - 0.5) return null;
+        if (pinned) return unreachable('pinned-outside-window');
+        if (fullPage || box[hi] <= start + 0.5 || box[lo] >= end - 0.5) return unreachable('outside-document');
         const after = box[lo] >= view[1];
         steps.push({ scope: 'page', axis, after,
           distance: Math.max(0, Math.round(after ? box[lo] - view[1] : view[0] - box[hi])) });
       }
-      return steps.length ? steps : null;
+      // In view by every box that contains it, yet no box was left to mark.
+      return steps.length ? { steps } : unreachable('too-small-to-mark');
     } catch (_) {
-      return null;
+      return unreachable('could-not-be-measured');
     }
   }
   const insideFrame = (() => { try { return window.top !== window; } catch (_) { return true; } })();
@@ -3275,6 +3364,30 @@ function isAllowedStructuralClickXPath(
       .replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(/\s+/).filter(token => token && !ignored.has(token))
       .map(token => token.length > 4 && token.endsWith('s') ? token.slice(0, -1) : token);
   }
+  // Elements of the requested kind that are not drawn at all - hidden by
+  // CSS, cut off by a box nobody can scroll, outside an open modal - are
+  // never dropped without a word: each is listed for the model and the
+  // evidence with why it is not drawn (it has no number and cannot be chosen).
+  const notDrawnCollected = [];
+  const notDrawnPool = [];
+  const notDrawnControls = new Set();
+  // Whether an element outside the picture is worth listing at all, and how:
+  // the same rules for both lists.
+  function listable(element, role, custom, listedControls) {
+    if (targetIntent.kind === 'text' && !ownText(element).length) return null;
+    const interactive = INTERACTIVE_TAGS.has(element.tagName) || CLICK_ROLES.has(role) || INPUT_ROLES.has(role) || element.isContentEditable;
+    if (broadDom) {
+      // Layout shells, and decoration inside an already listed control, add nothing.
+      if (!interactive && !ownText(element).length && !['svg', 'img', 'canvas'].includes(element.localName)) return null;
+      for (let current = hostParent(element), depth = 0; current && depth < 8; current = hostParent(current), depth += 1) {
+        if (listedControls.has(current)) return null;
+      }
+    }
+    const kind = candidateKind(element, role, compact(custom.kind).toLowerCase());
+    const fits = supportsAction(element, role, kind);
+    if (!hasExplicitTargetType && !fits && custom.force !== true) return null;
+    return { interactive, kind, fits };
+  }
   // First, for every element outside the picture: is it reachable, can it do
   // what the step does, and how many of the step's words does it carry
   // (cheaply: its own words, its row and its small group). Only the best are
@@ -3282,31 +3395,39 @@ function isAllowedStructuralClickXPath(
   function addHiddenCandidate(element, shadowPath, role, custom) {
     let layoutRect = targetIntent.kind === 'text' ? textRect(element) : element.getBoundingClientRect();
     if (broadDom && (!layoutRect || layoutRect.width < 1 || layoutRect.height < 1)) layoutRect = textRect(element);
-    const steps = scrollReach(element, layoutRect);
-    if (!steps) return;
-    if (targetIntent.kind === 'text' && !ownText(element).length) return;
-    const interactive = INTERACTIVE_TAGS.has(element.tagName) || CLICK_ROLES.has(role) || INPUT_ROLES.has(role) || element.isContentEditable;
-    if (broadDom) {
-      // Layout shells, and decoration inside an already listed control, add nothing.
-      if (!interactive && !ownText(element).length && !['svg', 'img', 'canvas'].includes(element.localName)) return;
-      for (let current = hostParent(element), depth = 0; current && depth < 8; current = hostParent(current), depth += 1) {
-        if (hiddenControls.has(current)) return;
-      }
+    else if (reachInfo?.get(element) && targetIntent.kind !== 'text' && (!layoutRect || layoutRect.width < 1 || layoutRect.height < 1)) {
+      layoutRect = contentRect(element);
     }
-    const kind = candidateKind(element, role, compact(custom.kind).toLowerCase());
-    const fits = supportsAction(element, role, kind);
-    if (!hasExplicitTargetType && !fits && custom.force !== true) return;
+    const reach = scrollReach(element, layoutRect);
+    if (!reach.steps || !collectHidden) {
+      addNotDrawn(element, shadowPath, role, custom, reach.steps ? 'outside-picture' : reach.why);
+      return;
+    }
+    const listing = listable(element, role, custom, hiddenControls);
+    if (!listing) return;
+    const { interactive, kind, fits } = listing;
     seen.add(element);
     // Its contents are part of it - except for a row, cell or tree item, which
     // hold controls of their own (the same rule as the picture's grouping).
     if (interactive && !['row', 'gridcell', 'treeitem'].includes(role)) hiddenControls.add(element);
-    hiddenPool.push({ element, shadowPath: shadowPath.slice(), role, custom, kind, steps, fits: fits ? 1 : 0, score: 0, order: hiddenPool.length });
+    hiddenPool.push({ element, shadowPath: shadowPath.slice(), role, custom, kind, steps: reach.steps, fits: fits ? 1 : 0, score: 0, order: hiddenPool.length });
+  }
+  function addNotDrawn(element, shadowPath, role, custom, why, detail = '') {
+    if (!collectNotDrawn) return;
+    const listing = listable(element, role, custom, notDrawnControls);
+    if (!listing) return;
+    const { interactive, kind, fits } = listing;
+    seen.add(element);
+    if (interactive && !['row', 'gridcell', 'treeitem'].includes(role)) notDrawnControls.add(element);
+    notDrawnPool.push({ element, shadowPath: shadowPath.slice(), role, custom, kind, why: why || 'could-not-be-measured', detail,
+      fits: fits ? 1 : 0, score: 0, order: notDrawnPool.length });
   }
   // Cheap: its own words, its labels, its table row and its parent's text.
   function hintScore(element) {
     const row = element.closest?.('tr');
     const words = new Set(hintTokens([
-      ...['aria-label', 'placeholder', 'title', 'alt', 'name', 'id', 'data-testid', 'data-test', 'data-qa', 'data-cy'].map(name => element.getAttribute(name) || ''),
+      ...['aria-label', 'placeholder', 'title', 'alt', 'name', 'id', 'for', 'data-testid', 'data-test', 'data-qa', 'data-cy']
+        .filter(name => name !== 'for' || !broadDom).map(name => element.getAttribute(name) || ''),
       spacedText(element, 200),
       ...Array.from(element.labels || []).map(label => spacedText(label, 100)),
       row ? Array.from(row.cells || []).slice(0, 3).map(cell => spacedText(cell, 70)).join(' ') : '',
@@ -3359,6 +3480,40 @@ function isAllowedStructuralClickXPath(
         panel: step.panel ? panelName(step.panel) : null })),
     });
   }
+  // Not drawn: the most similar to the failed step first when there are more
+  // than can be described; the total is always reported.
+  function describeNotDrawn() {
+    let best = notDrawnPool;
+    if (notDrawnPool.length > maxNotDrawn) {
+      if (hiddenHints.size) for (const item of notDrawnPool) item.score = hintScore(item.element);
+      // Elements without any box are only counted by the healer: describe them last.
+      const shown = item => (item.why === 'no-box' ? 0 : 1);
+      best = notDrawnPool.slice().sort((left, right) => (shown(right) - shown(left)) || (right.fits - left.fits) ||
+        (right.score - left.score) || (left.order - right.order))
+        .slice(0, maxNotDrawn).sort((left, right) => left.order - right.order);
+    }
+    // Described for reading only: no number, no live handle, never selectable.
+    for (const { element, shadowPath, role, custom, kind, why, detail } of best) {
+      notDrawnCollected.push({
+        tag: element.tagName.toLowerCase(),
+        role,
+        kind,
+        accessible_name: compact(custom.name || accessibleName(element)),
+        label: associatedLabel(element),
+        text: compact(targetIntent.kind === 'text' ? ownText(element).map(node => node.textContent).join(' ') : element.textContent || "", 100),
+        attributes: getAttrs(element),
+        enabled: !isDisabled(element),
+        editable: isEditable(element, role),
+        clickable: isClickable(element, role),
+        context: compact(contextSignature(element), 120),
+        shadow_path: shadowPath.slice(),
+        custom_rule: custom.ruleName || "",
+        ...presentationContext(element),
+        why,
+        why_detail: detail || '',
+      });
+    }
+  }
 
   // ---- Shortened exact names ---------------------------------------------
   // The name a locator of this kind matches on: the accessible name for a
@@ -3394,17 +3549,29 @@ function isAllowedStructuralClickXPath(
     if (!element || element.nodeType !== 1 || toolingNode(element) || seen.has(element)) return;
     const role = targetIntent.kind === 'role' && roleTargets.has(element) ? targetIntent.value : implicitRole(element);
     if (!targetMatches(element, role)) return;
+    // First pass: the browser's own answers from before capture. No box at all:
+    // counted, not shown. The step's pointer action cannot reach it: listed
+    // with why, not numbered - the model is not offered what cannot work.
+    const reach = reachInfo?.get(element);
+    if (reach && !reach.box) { addNotDrawn(element, shadowPath, role, custom, 'no-box'); return; }
+    if (reach?.blocked) { addNotDrawn(element, shadowPath, role, custom, 'cannot-receive-action', reach.blocked); return; }
     const rect = visibleRect(element);
     if (!rect) {
-      if (collectHidden) addHiddenCandidate(element, shadowPath, role, custom);
+      if (collectHidden || collectNotDrawn) addHiddenCandidate(element, shadowPath, role, custom);
       return;
     }
     const textBoxes = (broadDom || targetIntent.kind === 'text') ? visibleTextRects(element) : null;
-    if (targetIntent.kind === 'text' && !textBoxes.length) return;
+    if (targetIntent.kind === 'text' && !textBoxes.length) {
+      addNotDrawn(element, shadowPath, role, custom, 'text-not-visible');
+      return;
+    }
     // A text-only leaf with fully clipped/transparent glyphs has nothing to
     // display. Keep real controls/images and independently visible children.
     if (broadDom && ownText(element).length && !textBoxes.length && !element.children.length &&
-        !INTERACTIVE_TAGS.has(element.tagName) && !['svg', 'img', 'canvas'].includes(element.localName)) return;
+        !INTERACTIVE_TAGS.has(element.tagName) && !['svg', 'img', 'canvas'].includes(element.localName)) {
+      addNotDrawn(element, shadowPath, role, custom, 'text-not-visible');
+      return;
+    }
     const kind = candidateKind(element, role, compact(custom.kind).toLowerCase());
     // An explicit role/tag/text request determines what is numbered. Do not
     // discard blank divs, separators, empty status blocks or other requested
@@ -3442,6 +3609,8 @@ function isAllowedStructuralClickXPath(
       locator_candidates: [],
       custom_rule: custom.ruleName || "",
       ...(broadDom ? presentationContext(element) : {}),
+      // Reachable, but transparent or invisible right now (a styled checkbox's real input).
+      ...(reach?.invisible ? { may_be_hidden: 'transparent or invisible right now' } : {}),
     };
     recordsByElement.set(element, record);
     collected.push(record);
@@ -3521,6 +3690,7 @@ function isAllowedStructuralClickXPath(
       }
     }
     describeHiddenCandidates();
+    describeNotDrawn();
     countShortenedNames();
   } catch (error) {
     return { error: error?.message || String(error), elements: [] };
@@ -3778,6 +3948,11 @@ function isAllowedStructuralClickXPath(
     hidden_elements: hiddenCollected,
     hidden_total: hiddenPool.length,
     hidden_truncated: hiddenPool.length > hiddenCollected.length,
+    // Elements of the requested kind that are not drawn at all, with why.
+    not_drawn_version: 1,
+    not_drawn_elements: notDrawnCollected,
+    not_drawn_total: notDrawnPool.length,
+    not_drawn_no_box: notDrawnPool.filter(item => item.why === 'no-box').length,
     // Reachable elements of this kind named with only the exact name's words.
     shortened_name_count: exactNameWords.size ? shortenedNameCount : null,
   };

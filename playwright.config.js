@@ -14,6 +14,7 @@ module.exports = defineConfig({
     ['json', { outputFile: 'test-results/report.json' }],
     ['html', { outputFolder: 'playwright-report', open: 'never' }],
     ['allure-playwright', { resultsDir: 'allure-results' }],
+    ['./fixtures/allure_html_reporter.js', { resultsDir: 'allure-results', outputFolder: 'allure-report' }],
   ],
   use: {
     actionTimeout: 60000,     
