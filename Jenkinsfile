@@ -56,13 +56,17 @@ pipeline {
     stage('Prepare Dynamic Test Data') {
       steps {
         script {
+          // NOTE: the embedded script intentionally contains NO backslashes,
+          // so Groovy string escaping cannot alter it.
           writeFile file: '.jenkins/prepare-dynamic-test-data.cjs', text: '''\
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 async function main() {
   const projectId = process.env.PROJECT_ID || '';
-  const apiBase = (process.env.QUALIBRIX_API_URL || '').replace(/\\\\/+$/, '');
+  let apiBase = process.env.QUALIBRIX_API_URL || '';
+  while (apiBase.endsWith('/')) apiBase = apiBase.slice(0, -1);
 
   if (!projectId || !apiBase) {
     console.log('Dynamic test-data preparation skipped: PROJECT_ID or QUALIBRIX_API_URL is missing.');
@@ -93,7 +97,8 @@ async function main() {
   const endpoint = apiBase + '/api/projects/dynamic-test-data';
 
   for (const file of [...new Set(files)]) {
-    const source = fs.readFileSync(file, 'utf8').replace(/^\\\\uFEFF/, '');
+    let source = fs.readFileSync(file, 'utf8');
+    if (source.charCodeAt(0) === 0xFEFF) source = source.slice(1);
     const payload = JSON.parse(source);
     const response = await fetch(endpoint, {
       method: 'POST',
@@ -110,7 +115,7 @@ async function main() {
       throw new Error('Dynamic test-data API response has no payload for ' + file);
     }
 
-    fs.writeFileSync(file, JSON.stringify(result.payload, null, 2) + '\\n', 'utf8');
+    fs.writeFileSync(file, JSON.stringify(result.payload, null, 2) + os.EOL, 'utf8');
     console.log('Applied DB-backed dynamic test data to ' + path.relative(process.cwd(), file));
   }
 
@@ -136,7 +141,7 @@ main().catch(error => {
         script {
           def targets = (params.TARGET ?: '')
             .split(',')
-            .collect { it.trim().replace('\\\\', '/') }
+            .collect { it.trim().replace('\\', '/') }
             .findAll { it }
 
           def browser = (params.BROWSER ?: '').trim()
