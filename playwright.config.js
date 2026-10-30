@@ -1,24 +1,15 @@
-const { defineConfig } = require('@playwright/test');
-const os = require('os');
+const { defineConfig, devices } = require('@playwright/test');
 
 module.exports = defineConfig({
+  testDir: './tests',
+
   reporter: [
     ['list'],
-    [
-      'allure-playwright',
-      {
-        resultsDir: 'allure-results',
-        detail: true,
-        suiteTitle: true,
-        environmentInfo: {
-          Project: 'Playwright Automation',
-          Environment: process.env.TEST_ENV || 'QA',
-          Browser: 'Chromium',
-          OS: `${os.platform()} ${os.release()}`,
-          NodeVersion: process.version,
-        },
-      },
-    ],
+    ['allure-playwright', {
+      resultsDir: 'allure-results',
+      detail: true,
+      suiteTitle: true,
+    }],
   ],
 
   use: {
@@ -26,4 +17,11 @@ module.exports = defineConfig({
     video: 'retain-on-failure',
     trace: 'retain-on-failure',
   },
+
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],
 });
