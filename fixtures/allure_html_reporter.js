@@ -548,6 +548,73 @@ function addRunSummary(reportFolder, resultsDir) {
   return summary;
 }
 
+// ---------------------------------------------------------------------------
+// Executors: who ran this report (Allure's Overview -> Executors panel), from
+// executor.json in the results. Precedence:
+//   1. an executor.json you put in the project's allure-results yourself;
+//   2. Jenkins, read from the variables Jenkins sets for every build
+//      (JENKINS_URL, JOB_NAME, BUILD_NUMBER, BUILD_URL);
+//   3. a local run: this machine and the run folder.
+// Any field can be set with ALLURE_EXECUTOR_NAME / _TYPE / _URL / _BUILD_NAME /
+// _BUILD_URL / _BUILD_ORDER / _REPORT_URL / _REPORT_NAME (these win over 2 and 3).
+// ---------------------------------------------------------------------------
+function executorInfo(outputFolder, env = process.env) {
+  const clean = value => (value == null || String(value).trim() === '' ? undefined : String(value).trim());
+  const withSlash = value => (value && !value.endsWith('/') ? `${value}/` : value);
+  let info;
+  if (clean(env.JENKINS_URL) || clean(env.BUILD_URL)) {
+    const buildUrl = withSlash(clean(env.BUILD_URL));
+    info = {
+      name: 'Jenkins',
+      type: 'jenkins',
+      url: clean(env.JENKINS_URL),
+      buildOrder: Number.parseInt(env.BUILD_NUMBER, 10) || undefined,
+      buildName: clean(env.BUILD_DISPLAY_NAME) && clean(env.JOB_NAME)
+        ? `${env.JOB_NAME} ${env.BUILD_DISPLAY_NAME}`
+        : (clean(env.JOB_NAME) ? `${env.JOB_NAME} #${env.BUILD_NUMBER || ''}`.trim() : undefined),
+      buildUrl,
+      reportUrl: buildUrl ? `${buildUrl}allure` : undefined,
+      reportName: 'Allure Report',
+    };
+  } else {
+    // The backend writes each run to test-results/<run-folder>/allure-report.
+    const runFolder = path.basename(path.dirname(outputFolder || ''));
+    info = {
+      name: `Qualibrix local run (${os.hostname()})`,
+      type: 'local',
+      buildName: /^run-/.test(runFolder) ? runFolder : `run ${new Date().toISOString().replace(/\.\d+Z$/, 'Z')}`,
+      reportName: 'Allure Report',
+    };
+  }
+  const overrides = {
+    name: clean(env.ALLURE_EXECUTOR_NAME),
+    type: clean(env.ALLURE_EXECUTOR_TYPE),
+    url: clean(env.ALLURE_EXECUTOR_URL),
+    buildName: clean(env.ALLURE_EXECUTOR_BUILD_NAME),
+    buildUrl: clean(env.ALLURE_EXECUTOR_BUILD_URL),
+    buildOrder: Number.parseInt(env.ALLURE_EXECUTOR_BUILD_ORDER, 10) || undefined,
+    reportUrl: clean(env.ALLURE_EXECUTOR_REPORT_URL),
+    reportName: clean(env.ALLURE_EXECUTOR_REPORT_NAME),
+  };
+  for (const [key, value] of Object.entries(overrides)) if (value !== undefined) info[key] = value;
+  return Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined));
+}
+
+// Puts executor.json into the staged results. A file the user placed in the
+// results folder is kept as it is (it may be older than this run, so it is
+// copied here when the run's own copy step skipped it).
+function stageExecutor(staging, resultsDir, outputFolder) {
+  const staged = path.join(staging, 'executor.json');
+  const own = path.join(resultsDir, 'executor.json');
+  if (fs.existsSync(own)) {
+    if (!fs.existsSync(staged)) fs.copyFileSync(own, staged);
+    return 'your executor.json';
+  }
+  const info = executorInfo(outputFolder);
+  fs.writeFileSync(staged, JSON.stringify(info, null, 2));
+  return `${info.name}${info.buildName ? `, ${info.buildName}` : ''}`;
+}
+
 class AllureHtmlReporter {
   constructor(options = {}) {
     // Playwright's CLI reporter uses the project-relative allure-results folder;
@@ -631,6 +698,11 @@ class AllureHtmlReporter {
     try {
       // Allure 3 has no --clean: a previous report must not leave files behind.
       fs.rmSync(this.outputFolder, { recursive: true, force: true });
+      try {
+        console.log(`[allure-html] Executor: ${stageExecutor(staging, this.resultsDir, this.outputFolder)}`);
+      } catch (error) {
+        console.log(`[allure-html] Executor details not added: ${error.message}`);
+      }
       const config = path.join(staging, 'allurerc.json');
       fs.writeFileSync(config, JSON.stringify(REPORT_CONFIG));
       const { command, args, shell } = this.generator();

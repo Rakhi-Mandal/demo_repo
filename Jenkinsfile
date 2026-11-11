@@ -136,6 +136,39 @@ main().catch(error => {
       }
     }
 
+    stage('Clean Previous Reports') {
+      steps {
+        script {
+          // Removes the previous build's Allure results and reports from a reused
+          // workspace, so this build's reports show only this build's tests.
+          // allure-results/history is kept: it carries the trend graphs forward.
+          // NOTE: the embedded script intentionally contains NO backslashes.
+          writeFile file: '.jenkins/clean-previous-reports.cjs', text: '''\
+const fs = require('node:fs');
+
+const resultsDir = 'allure-results';
+let removed = 0;
+if (fs.existsSync(resultsDir)) {
+  for (const name of fs.readdirSync(resultsDir)) {
+    if (name === 'history') continue;
+    fs.rmSync(resultsDir + '/' + name, { recursive: true, force: true });
+    removed += 1;
+  }
+}
+for (const folder of ['allure-report', 'playwright-report']) {
+  fs.rmSync(folder, { recursive: true, force: true });
+}
+console.log('Cleared ' + removed + ' old Allure result file(s); kept allure-results/history for trends.');
+'''
+          if (isUnix()) {
+            sh 'node .jenkins/clean-previous-reports.cjs'
+          } else {
+            bat 'node .jenkins/clean-previous-reports.cjs'
+          }
+        }
+      }
+    }
+
     stage('Run Tests') {
       steps {
         script {
@@ -170,13 +203,14 @@ main().catch(error => {
           def headedArg = params.HEADED ? ' --headed' : ''
           def command = "npx playwright test ${targetArgs} --project=${browser}${headedArg}"
 
-          if (isUnix()) {
-            withEnv(['PLAYWRIGHT_HTML_OPEN=never']) {
+          // withEnv on both platforms: a Windows 'set X=never && ...' keeps the
+          // space before && in the value ("never ").
+          withEnv(['PLAYWRIGHT_HTML_OPEN=never']) {
+            if (isUnix()) {
               sh(label: 'Run selected Playwright tests', script: command)
+            } else {
+              bat(label: 'Run selected Playwright tests', script: command)
             }
-          } else {
-            bat(label: 'Run selected Playwright tests',
-                script: "set PLAYWRIGHT_HTML_OPEN=never && ${command}")
           }
         }
       }
@@ -190,10 +224,16 @@ main().catch(error => {
         allowEmptyArchive: true
       )
 
-      allure([
-        includeProperties: false,
-        jdk: '',
-        results: [[path: 'allure-results']]
+      // The Qualibrix Allure report, built during the test run by
+      // fixtures/allure_html_reporter.js: Run summary page with charts, modules,
+      // healed-locator blocks and this build as the executor.
+      publishHTML([
+        reportDir: 'allure-report',
+        reportFiles: 'index.html',
+        reportName: 'Allure Report (Qualibrix)',
+        keepAll: true,
+        alwaysLinkToLastBuild: true,
+        allowMissing: true
       ])
 
       publishHTML([
