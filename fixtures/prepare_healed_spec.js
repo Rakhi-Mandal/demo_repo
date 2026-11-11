@@ -194,7 +194,51 @@ function createHealedSpecEditor(specFile) {
         requirements: { assertion_only: actionMethods.length === 0, click: clicks, editable: editsText },
         source: 'same-binding-straight-line-source' };
     },
-    plan(origin, xpath) {
+    /*
+     * The selector the source passes to this locator call, split into literal
+     * text and the code that supplies the rest ("xpath=..." + String(testData.x)
+     * .toLowerCase() + "..."). null when it is one plain string - or anything
+     * this cannot read exactly.
+     */
+    describeSelectorSource(origin) {
+      const argument = callAt(origin?.site)?.arguments?.[0];
+      if (!argument || argument.type === 'StringLiteral') return null;
+      const parts = [];
+      let dynamic = false;
+      const flatten = node => {
+        if (node.type === 'StringLiteral') {
+          if (node.value) parts.push({ text: node.value });
+        } else if (node.type === 'TemplateLiteral') {
+          node.quasis.forEach((quasi, index) => {
+            if (typeof quasi.value?.cooked !== 'string') throw new Error('Unreadable template text');
+            if (quasi.value.cooked) parts.push({ text: quasi.value.cooked });
+            const expression = node.expressions[index];
+            if (expression) {
+              dynamic = true;
+              parts.push({ code: baseline.slice(expression.start, expression.end) });
+            }
+          });
+        } else if (node.type === 'BinaryExpression' && node.operator === '+') {
+          flatten(node.left);
+          flatten(node.right);
+        } else {
+          dynamic = true;
+          parts.push({ code: baseline.slice(node.start, node.end) });
+        }
+      };
+      try { flatten(argument); } catch (_) { return null; }
+      // The concatenation must start with text, or + would not be string concatenation.
+      return dynamic && parts[0]?.text !== undefined ? parts : null;
+    },
+    /*
+     * options.keepExisting: the locator worked earlier in this run, so it is
+     * not replaced - the healed locator is added as one more alternative:
+     *   page.locator(original).or(page.locator(healed)).first()
+     * Each use then finds whichever works (the first of them in the page when
+     * more than one does). At most options.maxAlternatives are kept, the
+     * original always among them.
+     */
+    plan(origin, xpath, segments = null, options = {}) {
       checkDisk();
       if (typeof xpath !== 'string' || !xpath.trim()) throw new Error('A proven XPath is required');
       const root = callAt(origin?.root);
@@ -215,9 +259,18 @@ function createHealedSpecEditor(specFile) {
       const scope = root.callee.object;
       if (!scope || scope.start === undefined) throw new Error('Missing source page/frame scope');
       const scopeCode = baseline.slice(scope.start, scope.end);
-      const replacement = `${scopeCode}.locator(${JSON.stringify(`xpath=${xpath}`)})`;
+      // With segments, the source's own test data references stay in the healed
+      // line ("xpath=..." + String(testData.x).toLowerCase() + "...") instead of
+      // the value they held during this run.
+      const healed = Array.isArray(segments) && segments.some(segment => segment.code !== undefined)
+        ? `${scopeCode}.locator(${selectorSegmentsCode(segments)})`
+        : `${scopeCode}.locator(${JSON.stringify(`xpath=${xpath}`)})`;
+      const editKey = `${node.start}:${node.end}`;
+      const replacement = options.keepExisting
+        ? withLocatorAlternative(edits.has(editKey) ? edits.get(editKey).replacement : baseline.slice(node.start, node.end),
+          healed, options.maxAlternatives, source => parse(`(${source});`).program.body[0].expression)
+        : healed;
       const edit = { start: node.start, end: node.end, replacement };
-      const editKey = `${edit.start}:${edit.end}`;
       const proposed = new Map(edits);
       proposed.set(editKey, edit);
       render(proposed);
@@ -266,6 +319,48 @@ function createHealedSpecEditor(specFile) {
   };
   editors.set(key, editor);
   return editor;
+}
+
+// The locator expression `current` with `healed` as one more alternative:
+// base.or(alt1).or(alt2).first(). An expression already written that way is
+// extended, not wrapped again; an alternative it already has is not added
+// twice. Beyond `limit`, the oldest added alternative goes; the base stays.
+function withLocatorAlternative(current, healed, limit, parseExpression) {
+  const source = String(current);
+  // Offsets are into "(source);" - one character in.
+  const text = node => source.slice(node.start - 1, node.end - 1);
+  const isCall = (node, name, count) => node?.type === 'CallExpression' && node.callee?.type === 'MemberExpression' &&
+    !node.callee.computed && node.callee.property?.name === name && node.arguments.length === count;
+  let node = parseExpression(source);
+  if (isCall(node, 'first', 0) && isCall(node.callee.object, 'or', 1)) node = node.callee.object;
+  const alternatives = [];
+  while (isCall(node, 'or', 1)) {
+    alternatives.unshift(text(node.arguments[0]));
+    node = node.callee.object;
+  }
+  const all = [text(node), ...alternatives];
+  const same = value => value.replace(/\s+/g, '');
+  if (all.some(item => same(item) === same(healed))) return source;
+  all.push(healed);
+  const most = Math.max(2, Number(limit) || 4);
+  while (all.length > most) all.splice(1, 1);
+  return `${all[0]}${all.slice(1).map(item => `.or(${item})`).join('')}.first()`;
+}
+
+// [{ text } | { code }] -> "text" + code + "text" (code in parentheses unless it is a plain name/member/call chain).
+function selectorSegmentsCode(segments) {
+  const merged = [];
+  for (const segment of segments) {
+    if (segment.text !== undefined) {
+      if (!segment.text) continue;
+      if (merged.length && merged[merged.length - 1].text !== undefined) merged[merged.length - 1] = { text: merged[merged.length - 1].text + segment.text };
+      else merged.push({ text: segment.text });
+    } else merged.push({ code: String(segment.code) });
+  }
+  if (merged[0]?.text === undefined) merged.unshift({ text: '' });
+  const plain = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[[^\[\]]*\]|\([^()]*\))*$/;
+  return merged.map(segment => segment.text !== undefined ? JSON.stringify(segment.text)
+    : plain.test(segment.code.trim()) ? segment.code.trim() : `(${segment.code.trim()})`).join(' + ');
 }
 
 function slash(value) {
@@ -330,14 +425,26 @@ function literalTitle(node) {
 function listTestCallbacks(source, file) {
   const ast = parseSyncSource(source, file);
   const tests = [];
-  function visit(node) {
+  function visit(node, parent = null, grandparent = null) {
     if (!node || typeof node !== 'object' || typeof node.type !== 'string') return;
     if (node.type === 'CallExpression' && isTestCallee(node.callee) && node.arguments.length >= 2) {
       const callback = node.arguments[node.arguments.length - 1];
       if (callback && (callback.type === 'ArrowFunctionExpression' || callback.type === 'FunctionExpression') &&
           callback.body && Number.isInteger(callback.body.start) && Number.isInteger(callback.body.end)) {
+        const titleNode = node.arguments[0];
+        const title = literalTitle(titleNode);
         tests.push({
-          title: literalTitle(node.arguments[0]),
+          title,
+          // The title literal's own range, so a sync can carry the title across too.
+          titleStart: title && Number.isInteger(titleNode.start) ? titleNode.start : null,
+          titleEnd: title && Number.isInteger(titleNode.end) ? titleNode.end : null,
+          titleCode: title && Number.isInteger(titleNode.start) && Number.isInteger(titleNode.end)
+            ? source.slice(titleNode.start, titleNode.end) : '',
+          // The whole top-level `test(...);` statement, so a test that exists only
+          // in the other file can be copied across. Null for a test nested in
+          // describe() or another block: it cannot be moved on its own.
+          statementStart: parent?.type === 'ExpressionStatement' && grandparent?.type === 'Program' ? parent.start : null,
+          statementEnd: parent?.type === 'ExpressionStatement' && grandparent?.type === 'Program' ? parent.end : null,
           start: callback.body.start,
           end: callback.body.end,
           code: source.slice(callback.body.start, callback.body.end),
@@ -346,8 +453,8 @@ function listTestCallbacks(source, file) {
     }
     for (const [name, value] of Object.entries(node)) {
       if (['loc', 'tokens', 'comments', 'leadingComments', 'trailingComments', 'innerComments', 'extra'].includes(name)) continue;
-      if (Array.isArray(value)) for (const child of value) visit(child);
-      else if (value && typeof value === 'object') visit(value);
+      if (Array.isArray(value)) for (const child of value) visit(child, node, parent);
+      else if (value && typeof value === 'object') visit(value, node, parent);
     }
   }
   visit(ast);
@@ -355,7 +462,16 @@ function listTestCallbacks(source, file) {
   return tests;
 }
 
-function copyTestBodies(donorSource, targetSource, donorFile, targetFile, donorDirectory, targetDirectory) {
+// options.syncTitles: also give each target test the donor's title. Only the
+// source -> healed direction uses it. The title (for example the "Test case id:
+// TC-108 - ..." prefix added to the source after the healed copy was made) is
+// written in the source; the healed copy must carry the same title, or a report
+// title from the source spec no longer matches any test in the healed file.
+// options.appendMissing: a test that exists only in the donor (a recording
+// appended to the source spec) is added to the end of the target, with the
+// imports it needs. Same direction only. A test that cannot be copied (inside a
+// describe block) is counted in `notCopied`, never dropped silently.
+function copyTestBodies(donorSource, targetSource, donorFile, targetFile, donorDirectory, targetDirectory, options = {}) {
   const donorTests = listTestCallbacks(donorSource, donorFile);
   const targetTests = listTestCallbacks(targetSource, targetFile);
   if (!donorTests.length) throw new Error('No test(() => ...) body found in ' + donorFile);
@@ -372,17 +488,49 @@ function copyTestBodies(donorSource, targetSource, donorFile, targetFile, donorD
     if (donorIndex < 0) donorIndex = donorTests.findIndex((_item, itemIndex) => !used.has(itemIndex));
     if (donorIndex < 0) continue;
     used.add(donorIndex);
+    const donorTest = donorTests[donorIndex];
+    if (options.syncTitles && donorTest.titleCode && targetTest.titleCode &&
+        donorTest.title !== targetTest.title && targetTest.titleStart !== null) {
+      replacements.push({ start: targetTest.titleStart, end: targetTest.titleEnd, replacement: donorTest.titleCode });
+    }
     const rewritten = rewriteRelativeModules(donorTests[donorIndex].code, donorDirectory, targetDirectory);
     if (rewritten !== targetTest.code) {
       replacements.push({ start: targetTest.start, end: targetTest.end, replacement: rewritten });
+    }
+  }
+  let appended = '';
+  let notCopied = 0;
+  if (options.appendMissing) {
+    donorTests.forEach((donorTest, donorIndex) => {
+      if (used.has(donorIndex)) return;
+      if (donorTest.statementStart === null) { notCopied += 1; return; }
+      appended += '\n\n' + rewriteRelativeModules(
+        donorSource.slice(donorTest.statementStart, donorTest.statementEnd), donorDirectory, targetDirectory);
+    });
+    const firstStatement = targetTests.find(item => item.statementStart !== null);
+    if (appended && firstStatement) {
+      // Imports the new test needs that the target does not have yet.
+      const wanted = [];
+      for (const line of donorSource.match(/^[ \t]*import\s+[^\r\n]+$/gm) || []) {
+        if (isPreambleLine(line)) continue;
+        const rewritten = rewriteRelativeModules(line.trim(), donorDirectory, targetDirectory);
+        const from = rewritten.match(/\bfrom\s*(['"])([^'"]+)\1/);
+        const present = targetSource.includes(rewritten) ||
+          (from && (targetSource.includes(`'${from[2]}'`) || targetSource.includes(`"${from[2]}"`)));
+        if (!present && !wanted.includes(rewritten)) wanted.push(rewritten);
+      }
+      if (wanted.length) {
+        replacements.push({ start: firstStatement.statementStart, end: firstStatement.statementStart, replacement: wanted.join('\n') + '\n\n' });
+      }
     }
   }
   let result = targetSource;
   for (const edit of replacements.sort((a, b) => b.start - a.start)) {
     result = result.slice(0, edit.start) + edit.replacement + result.slice(edit.end);
   }
+  if (appended) result = result.replace(/\s+$/, '') + appended + '\n';
   parseSyncSource(result, targetFile);
-  return { content: result, updated: replacements.length > 0 };
+  return { content: result, updated: replacements.length > 0 || Boolean(appended), notCopied };
 }
 
 function jsString(value) {
@@ -1105,7 +1253,12 @@ function prepareHealedSpec(sourceFile, options = {}) {
     const sourceDirectory = path.dirname(absoluteSource);
     if (fs.existsSync(outputFile)) {
       const currentHealed = fs.readFileSync(outputFile, 'utf8');
-      const copied = copyTestBodies(original, currentHealed, absoluteSource, outputFile, sourceDirectory, outputDirectory);
+      const copied = copyTestBodies(original, currentHealed, absoluteSource, outputFile, sourceDirectory, outputDirectory, { syncTitles: true, appendMissing: true });
+      if (copied.notCopied) {
+        // Stays loud: this module's console is silenced, stderr is not.
+        process.stderr.write('[healed-sync] ' + copied.notCopied + ' test(s) in ' + absoluteSource +
+          ' sit inside a describe()/block and were NOT copied to ' + outputFile + '\n');
+      }
       const nextHealed = matchLineEndings(copied.content, currentHealed);
       if (!copied.updated || nextHealed === currentHealed) {
         sync = { updated: false, deferred: false, preserved: 0, dropped: 0 };

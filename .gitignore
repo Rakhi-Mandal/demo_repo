@@ -17,3 +17,8 @@ allure-report/
 *.running-*.lock
 *.sync-*.tmp
 fixtures/framework_location.json
+
+# Test data (holds login emails and passwords)
+test-data.json
+test-data.base.json
+*.test-data.json

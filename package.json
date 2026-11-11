@@ -4,14 +4,30 @@
   "version": "1.0.0",
   "scripts": {
     "test": "playwright test",
-    "test:sanity": "playwright test sanity --project=chromium",
-    "test:regression": "playwright test regression --project=chromium"
+    "test:sanity": "playwright test --grep @sanity --project=chromium",
+    "test:regression": "playwright test --grep @regression --project=chromium",
+    "test:chromium": "playwright test --config=playwright.config.js --project=chromium",
+    "test:all": "playwright test --config=playwright.config.js",
+    "allure:generate": "allure generate --config ./allurerc.mjs",
+    "allure:open": "allure open ./allure-report",
+    "stability:status": "node fixtures/stability.cjs status",
+    "stability:off": "node fixtures/stability.cjs off",
+    "stability:on": "node fixtures/stability.cjs on",
+    "stability:wait": "node fixtures/stability.cjs wait",
+    "learning:off": "node fixtures/stability.cjs learning off",
+    "learning:on": "node fixtures/stability.cjs learning on",
+    "testdata:watch": "node fixtures/test_data_cli.cjs watch",
+    "testdata:show": "node fixtures/test_data_cli.cjs show",
+    "testdata:toggle": "node fixtures/test_data_cli.cjs toggle",
+    "testdata:link": "node fixtures/test_data_cli.cjs link"
   },
   "devDependencies": {
-    "@playwright/test": "^1.63.0",
-    "allure-playwright": "^3.13.0",
+    "@allurereport/plugin-awesome": "^3.22.1",
+    "@allurereport/plugin-dashboard": "^3.22.1",
     "@babel/parser": "^8.0.4",
+    "@playwright/test": "^1.63.0",
     "allure": "^3.20.1",
+    "allure-playwright": "^3.13.0",
     "dotenv": "^16.6.1"
   }
 }

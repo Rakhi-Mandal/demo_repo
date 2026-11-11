@@ -1,13 +1,12 @@
-import testData from '../../test-data.json';
-const { test, expect } = require('../../fixtures/walker_fixture.js');
-const { heal } = require('../../fixtures/inline_healer.js');
+const { test, expect } = require('../../../fixtures/walker_fixture.js');
+import testData from '../../../test-data.json';
 
-test('create product @sanity', async ({ page }) => {
+test('create product @regression', async ({ page }) => {
   await page.goto(testData.url);
   await page.waitForLoadState('domcontentloaded');
  
-  await expect(page.getByRole('button', { name: 'Sign in with Email' })).toBeEnabled();
-  await page.getByRole('button', { name: 'Sign in with Email' }).click();
+  await expect(page.getByRole('button', { name: 'Sign in ' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Sign in ' }).click();
  
   await expect(page.locator('input[name="email"]')).toBeEnabled();
   await page.locator('input[name="email"]').click();

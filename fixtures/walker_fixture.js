@@ -58,6 +58,7 @@ if (!healerPath) throw new Error('walker_fixture.js could not find inline_healer
 const {
   createHealingPage,
   createHealingExpect,
+  installTransientMemory,
   RAW_PAGE,
 } = require(healerPath);
 
@@ -330,8 +331,12 @@ function publishLatestEvidence() {
   try {
     const { testInfo } = evidence;
     const { shots, heals } = healEvidenceOf(testInfo);
-    // No heal in this test: nothing new comes over, the folder stays as it is.
-    if (!shots.length && !heals.length) return;
+    // A test that did not pass: its failure screenshot is what "latest" must show,
+    // heal evidence or not (an earlier heal in the test, or a failing step the
+    // healer never tried, used to leave the previous run's pictures in the folder).
+    const testFailed = ['failed', 'timedOut', 'interrupted'].includes(String(testInfo.status || ''));
+    // No heal in this test and it passed: nothing new comes over, the folder stays as it is.
+    if (!shots.length && !heals.length && !testFailed) return;
     const directory = latestEvidenceDirectory();
     if (!directory) return;
     fs.mkdirSync(directory, { recursive: true });
@@ -363,7 +368,9 @@ function publishLatestEvidence() {
     // one after others that did take theirs: Playwright's own picture of the
     // page when the test failed (one per open tab).
     const stoppedWithoutPicture = heals.filter(heal => heal.labelledScreenshots === 0 && heal.healResult !== 'healed');
-    const failureScreenshots = shots.length && !stoppedWithoutPicture.length ? [] : attachments
+    // Also whenever the test failed: the labelled pictures are from the heals, the
+    // failure screenshot is the page where the test finally stopped.
+    const failureScreenshots = shots.length && !stoppedWithoutPicture.length && !testFailed ? [] : attachments
       .filter(item => item && item.name === 'screenshot' && existingFile(item.path))
       .map((item, index, all) => ({ source: item.path, file: all.length === 1 ? 'failure-screenshot.png' : `failure-screenshot-${index + 1}.png` }));
     for (const shot of failureScreenshots) stage(shot.file, file => fs.copyFileSync(shot.source, file));
@@ -396,9 +403,15 @@ function publishLatestEvidence() {
         file: shot.file, heal: shot.heal, try: shot.try, step: shot.step, healResult: shot.healResult, shot: shot.shot,
       })),
       failureScreenshots: failureScreenshots.filter(shot => saved(shot.file)).map(shot => shot.file),
-      note: !stoppedWithoutPicture.length ? null : !shots.length
-        ? 'The heal stopped before it could take a labelled screenshot, so this is Playwright\'s screenshot of the page when the test failed.'
-        : `Heal ${stoppedWithoutPicture.map(heal => heal.heal).join(', ')} stopped before it could take a labelled screenshot; the failure screenshot is Playwright's picture of the page when the test failed.`,
+      note: stoppedWithoutPicture.length
+        ? (!shots.length
+          ? 'The heal stopped before it could take a labelled screenshot, so this is Playwright\'s screenshot of the page when the test failed.'
+          : `Heal ${stoppedWithoutPicture.map(heal => heal.heal).join(', ')} stopped before it could take a labelled screenshot; the failure screenshot is Playwright's picture of the page when the test failed.`)
+        : (testFailed && !heals.length
+          ? 'The test failed at a step the healer did not try to heal (it covers click, fill, type, check, uncheck, selectOption, press, hover and toBeVisible / toBeEnabled / toBeEditable). failure-screenshot is Playwright\'s picture of the page when the test failed.'
+          : (testFailed && failureScreenshots.length
+            ? 'The test failed after the heals listed here. failure-screenshot is Playwright\'s picture of the page where it failed; the labelled screenshots are from the heals.'
+            : null)),
       trace: saved('trace.zip') ? 'trace.zip' : null,
       problems,
     };
@@ -409,12 +422,32 @@ function publishLatestEvidence() {
 
 process.on('exit', publishLatestEvidence);
 
+// Run from a folder without a Playwright config (inside healed\ or regression\,
+// say), Playwright uses none at all: 5 s checks, no stability checks, no
+// reports. Said once per worker, plainly, instead of being found out later.
+let warnedNoConfig = false;
+function warnWithoutConfig(testInfo) {
+  if (warnedNoConfig) return;
+  warnedNoConfig = true;
+  let configFile = '';
+  try { configFile = String((testInfo.config && testInfo.config.configFile) || ''); } catch (_) {}
+  if (configFile) return;
+  process.stderr.write(`[visual-heal] No Playwright config was found: this run started in ${process.cwd()}, and Playwright looks for ` +
+    'playwright.config.js only in the folder a run starts in. So the project config is not used - no stability checks, its ' +
+    'timeouts and reports are off. Run from the project folder (where playwright.config.js is), for example: ' +
+    'npx playwright test healed/<suite>/<name>.healed.spec.js --config playwright.healed.config.js\n');
+}
+
 exports.test = base.extend({
   page: async ({ page, testIdAttribute }, use, testInfo) => {
     // The previous test in this worker is completely over by now.
     publishLatestEvidence();
+    warnWithoutConfig(testInfo);
     beginHealedSpecRun(testInfo.file);
     const healingPage = createHealingPage(page, testInfo, { testIdAttribute });
+    // Every document of the test remembers what it shows only briefly (a toast,
+    // a status message), so a heal after it went can still offer it.
+    if (typeof installTransientMemory === 'function') await installTransientMemory(page);
     // This catalog was diagnostic-only and persisted page data after the test.
     // Visual healing performs its own live DOM scan only when recovery is needed.
     await use(healingPage);
