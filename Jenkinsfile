@@ -244,6 +244,30 @@ console.log('Cleared ' + removed + ' old Allure result file(s); kept allure-resu
         alwaysLinkToLastBuild: true,
         allowMissing: true
       ])
+
+      // The Jenkins Allure plugin builds its report from allure-results. This writes
+      // the Qualibrix customizations into that folder first: module / spec-file
+      // labels (Suites and Behaviors tabs), healed-locator blocks and tags, and the
+      // run + per-module counts as "Qualibrix.*" lines in the Environment panel.
+      // Lines already in environment.properties are kept, and it is safe to run again,
+      // so it does not matter whether your own environment step ran before or after
+      // the tests. (The Run summary page and charts exist only in the Qualibrix report.)
+      script {
+        def customize = 'node fixtures/allure_html_reporter.js --customize-results allure-results'
+        if (isUnix()) {
+          sh(script: customize, returnStatus: true)
+        } else {
+          bat(script: customize, returnStatus: true)
+        }
+      }
+
+      // The Jenkins Allure plugin's own report (needs the Allure commandline tool
+      // on the agent), now with the customizations written above.
+      allure([
+        includeProperties: false,
+        jdk: '',
+        results: [[path: 'allure-results']]
+      ])
     }
   }
 }

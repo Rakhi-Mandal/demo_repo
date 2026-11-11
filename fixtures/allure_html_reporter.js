@@ -45,6 +45,11 @@ function groupResultsByModule(resultsDir) {
       : 'Root';
     const labels = (result.labels || []).filter((label) => label.name !== 'parentSuite');
     labels.push({ name: 'parentSuite', value: moduleName });
+    // Behaviors tab: module -> spec file -> test (a label already on the test wins).
+    if (!labels.some((label) => label.name === 'epic')) labels.push({ name: 'epic', value: moduleName });
+    if (!labels.some((label) => label.name === 'feature')) {
+      labels.push({ name: 'feature', value: titleParts.slice(suiteIndex).join('/') });
+    }
     result.labels = labels;
     fs.writeFileSync(resultPath, JSON.stringify(result));
   }
@@ -58,7 +63,7 @@ function escapeHtml(value) {
 // The healer's own log for this run, one entry per heal attempt.
 function readHealEntries(healLogPath) {
   try {
-    const entries = JSON.parse(fs.readFileSync(healLogPath, 'utf8'));
+    const entries = JSON.parse(fs.readFileSync(healLogPath, 'utf8').replace(/^﻿/, ''));
     return (Array.isArray(entries) ? entries : []).filter(Boolean);
   } catch (_) {
     return [];
@@ -135,8 +140,11 @@ function addHealedLocators(resultsDir, healLogPath) {
     const mine = healed.filter(belongs);
     const notHealed = failed.filter(belongs);
     if (!mine.length && !notHealed.length) continue;
-    result.descriptionHtml = `${result.descriptionHtml || ''}${mine.length ? renderHealedLocators(mine) : ''}` +
-      `${notHealed.length ? renderFailedHeals(notHealed) : ''}`;
+    // Marked, so running this again on the same results (the Jenkinsfile does, before
+    // the Allure plugin) replaces the blocks instead of adding them a second time.
+    const withoutOld = String(result.descriptionHtml || '').replace(/<!--qbx-heal-->[\s\S]*?<!--\/qbx-heal-->/g, '');
+    result.descriptionHtml = `${withoutOld}<!--qbx-heal-->${mine.length ? renderHealedLocators(mine) : ''}` +
+      `${notHealed.length ? renderFailedHeals(notHealed) : ''}<!--/qbx-heal-->`;
     result.labels = (result.labels || []).filter(label => !(label.name === 'tag' && ['healed', 'heal-failed'].includes(label.value)));
     if (mine.length) result.labels.push({ name: 'tag', value: 'healed' });
     if (notHealed.length) result.labels.push({ name: 'tag', value: 'heal-failed' });
@@ -615,6 +623,56 @@ function stageExecutor(staging, resultsDir, outputFolder) {
   return `${info.name}${info.buildName ? `, ${info.buildName}` : ''}`;
 }
 
+// ---------------------------------------------------------------------------
+// The Jenkins Allure plugin builds its own report from allure-results. These
+// customizations are therefore also written INTO that folder:
+//   - module / spec-file labels and the healed-locator blocks (in the result files)
+//   - run and per-module counts, as Environment lines "Qualibrix.*" in
+//     environment.properties (lines already there are kept)
+// The Run summary page and charts are not part of this: they are added to the
+// reporter's own index.html only.
+// ---------------------------------------------------------------------------
+const ENV_PREFIX = 'Qualibrix.';
+
+function envKeyPart(text) {
+  return String(text).replace(/[^A-Za-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '') || 'unnamed';
+}
+
+function countsLine(row) {
+  return `${row.testCases} test case${row.testCases === 1 ? '' : 's'}: ${row.passed} passed, ${row.failed} failed, ` +
+    `${row.broken} broken, ${row.skipped} skipped`;
+}
+
+// Adds (or refreshes) the Qualibrix lines in dir/environment.properties; every other line stays.
+function mergeEnvironment(dir, summary) {
+  const file = path.join(dir, 'environment.properties');
+  let kept = [];
+  try {
+    kept = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(line => line.trim() !== '' && !line.startsWith(ENV_PREFIX));
+  } catch (_) {}
+  const t = summary.totals;
+  const ours = [
+    `${ENV_PREFIX}SpecFiles=${t.specFiles}`,
+    `${ENV_PREFIX}Modules=${t.modules}`,
+    `${ENV_PREFIX}TestCases=${t.testCases}`,
+    `${ENV_PREFIX}Passed=${t.passed}`,
+    `${ENV_PREFIX}Failed=${t.failed}`,
+    `${ENV_PREFIX}Broken=${t.broken}`,
+    `${ENV_PREFIX}Skipped=${t.skipped}`,
+    ...summary.modules.map(row => `${ENV_PREFIX}Module.${envKeyPart(row.module)}=${countsLine(row)} in ${row.specFiles} spec file${row.specFiles === 1 ? '' : 's'}`),
+  ];
+  fs.writeFileSync(file, `${[...kept, ...ours].join('\n')}\n`, 'utf8');
+}
+
+// All of the above, on one results folder. Safe to run more than once.
+function customizeResultsDir(dir, healLogPath) {
+  groupResultsByModule(dir);
+  addHealedLocators(dir, healLogPath);
+  const summary = summarizeResults(dir);
+  mergeEnvironment(dir, summary);
+  return summary;
+}
+
 class AllureHtmlReporter {
   constructor(options = {}) {
     // Playwright's CLI reporter uses the project-relative allure-results folder;
@@ -665,10 +723,32 @@ class AllureHtmlReporter {
       } catch (error) {
         console.log(`[allure-html] Healed locators not added to the report: ${error.message}`);
       }
+      try {
+        this.shareWithResultsDir(staging);
+      } catch (error) {
+        console.log(`[allure-html] Customizations not written to ${this.resultsDir}: ${error.message}`);
+      }
       return staging;
     }
     fs.rmSync(staging, { recursive: true, force: true });
     return null;
+  }
+
+  // The staged results carry the customizations. Copy them back over this run's files
+  // in allure-results, and add the Environment lines there, so the Jenkins Allure
+  // plugin (which reads allure-results) shows them too.
+  shareWithResultsDir(staging) {
+    let copied = 0;
+    for (const name of fs.readdirSync(staging)) {
+      if (!name.endsWith('-result.json')) continue;
+      fs.copyFileSync(path.join(staging, name), path.join(this.resultsDir, name));
+      copied += 1;
+    }
+    const summary = summarizeResults(staging);
+    mergeEnvironment(this.resultsDir, summary);
+    // The reporter's own report shows the same Environment lines.
+    fs.copyFileSync(path.join(this.resultsDir, 'environment.properties'), path.join(staging, 'environment.properties'));
+    console.log(`[allure-html] Customizations written to ${this.resultsDir} (${copied} result file(s), environment.properties)`);
   }
 
   persistHistory() {
@@ -736,3 +816,24 @@ class AllureHtmlReporter {
 }
 
 module.exports = AllureHtmlReporter;
+
+// Command line (the Jenkinsfile runs this just before the Allure plugin step, so the
+// plugin's report has the customizations whatever else wrote to allure-results):
+//   node fixtures/allure_html_reporter.js --customize-results [allure-results]
+if (require.main === module) {
+  const [flag, folder] = process.argv.slice(2);
+  if (flag === '--customize-results') {
+    const dir = path.resolve(folder || 'allure-results');
+    if (!fs.existsSync(dir)) {
+      console.log(`[allure-html] ${dir} does not exist; nothing to customize.`);
+    } else {
+      const summary = customizeResultsDir(dir, path.resolve(process.cwd(), 'test-results', 'inline_heals.json'));
+      const t = summary.totals;
+      console.log(`[allure-html] Customized ${dir}: ${t.specFiles} spec file(s), ${t.testCases} test case(s) in ${t.modules} module(s); ` +
+        `${t.passed} passed, ${t.failed} failed, ${t.broken} broken, ${t.skipped} skipped`);
+    }
+  } else {
+    console.log('Usage: node fixtures/allure_html_reporter.js --customize-results [allure-results]');
+    process.exitCode = 2;
+  }
+}
