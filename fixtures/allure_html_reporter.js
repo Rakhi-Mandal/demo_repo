@@ -398,49 +398,9 @@ function renderRunCharts(summary) {
   return `<div class="qs-charts">${statusShareChart(summary.totals)}${moduleStatusChart(summary.modules)}${failingSpecsChart(summary.specs)}</div>`;
 }
 
-function renderRunSummary(summary) {
-  const t = summary.totals;
-  const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
-  const num = (value, kind) => `<td class="qs-n${value && kind ? ` qs-${kind}` : ''}">${value}</td>`;
-  const countCells = row => num(row.testCases) + num(row.passed, 'passed') + num(row.failed, 'failed') +
-    num(row.broken, 'broken') + num(row.skipped, 'skipped');
-  const countHead = '<th class="qs-n">Test cases</th><th class="qs-n">Passed</th><th class="qs-n">Failed</th><th class="qs-n">Broken</th><th class="qs-n">Skipped</th>';
-  const moduleRows = summary.modules.map(row => `<tr><td>${escapeHtml(row.module)}</td><td>${escapeHtml(row.suite || '-')}</td>` +
-    `${num(row.specFiles)}${countCells(row)}</tr>`).join('');
-  const specRows = summary.specs.map(row => `<tr><td class="qs-code">${escapeHtml(row.spec)}</td><td>${escapeHtml(row.module)}</td>` +
-    `${countCells(row)}</tr>`).join('');
-  const failureRows = summary.failures.map((row, index) => `<tr><td class="qs-n">${index + 1}</td>` +
-    `<td class="qs-key">${escapeHtml(row.testCaseKey || '-')}</td><td>${escapeHtml(row.test)}</td><td>${escapeHtml(row.module)}</td>` +
-    `<td class="qs-code">${escapeHtml(row.spec)}</td><td class="qs-${row.status}">${escapeHtml(row.status)}</td>` +
-    `<td class="qs-msg">${escapeHtml(row.message || '-')}</td></tr>`).join('');
-  const tile = (label, value, kind = '') => `<div class="qs-tile${kind ? ` qs-tile-${kind}` : ''}"><div class="qs-v">${value}</div><div class="qs-l">${label}</div></div>`;
-  const table = (head, rows) => `<div class="qs-scroll"><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
-  // The page itself: shown in Allure's content area when the menu item is chosen.
-  const page = `<div class="qbx-rs-page">
-<h2 class="qs-title">Run summary</h2>
-<div class="qs-sub">${plural(t.modules, 'module')}, ${plural(t.specFiles, 'spec file')}, ${plural(t.testCases, 'test case')} &middot; a retried test counts once, by its last attempt</div>
-<div class="qs-tiles">${tile('Spec files', t.specFiles)}${tile('Test cases', t.testCases)}${tile('Modules', t.modules)}${tile('Passed', t.passed, 'passed')}${tile('Failed', t.failed, 'failed')}${tile('Broken', t.broken, 'broken')}${tile('Skipped', t.skipped, 'skipped')}</div>
-${renderRunCharts(summary)}
-<h3>By module</h3>
-${table(`<th>Module</th><th>Suite</th><th class="qs-n">Spec files</th>${countHead}`, moduleRows)}
-<h3>By spec file</h3>
-${table(`<th>Spec file</th><th>Module</th>${countHead}`, specRows)}
-<h3>Failures (${summary.failures.length})</h3>
-${summary.failures.length
-    ? table('<th class="qs-n">#</th><th>Test case id</th><th>Test</th><th>Module</th><th>Spec file</th><th>Status</th><th>Error</th>', failureRows)
-    : '<div class="qs-none">No failures in this run.</div>'}
-<div class="qs-tip" role="tooltip" hidden></div>
-</div>`;
-  // A menu entry like Overview / Categories / Suites. Allure rebuilds its menu on
-  // every tab switch, so the entry is put back whenever the menu is drawn again.
-  // Its route (#run-summary) is unknown to Allure, which shows "Not found" there:
-  // the summary page takes that place, and leaves when another tab is chosen.
-  return `
-<div id="qbx-run-summary" data-generated="${escapeHtml(summary.generatedAt)}">
-<style>
-/* Its own scroll area filling Allure's content pane: the pane only scrolls when its
-   child stays within it, so a long page grew the pane and got clipped (no scroll). */
-.qbx-rs-page{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;box-sizing:border-box;padding:24px 32px 48px;font-size:13px;line-height:1.45;color:inherit}
+// Styles for the Run summary page. Shared by the page embedded in Allure's index.html
+// (the standalone run-summary.html has no stylesheet at all: see renderPlainRunSummary).
+const RUN_SUMMARY_CSS = `.qbx-rs-page{box-sizing:border-box;padding:24px 32px 48px;font-size:13px;line-height:1.45;color:inherit}
 .qbx-rs-page>*:not(.qs-tip){max-width:1216px}
 .qbx-rs-page .qs-charts{display:grid;gap:20px;margin-top:24px}
 .qbx-rs-page .qs-chart{border:1px solid rgba(127,127,127,.28);border-radius:8px;padding:14px 18px 12px;background:rgba(127,127,127,.04);overflow-x:auto}
@@ -486,7 +446,131 @@ html[data-theme="dark"] .qbx-rs-page .qs-tip{background:#f6f8fa;color:#1f2328}
 html[data-theme="dark"] .qbx-rs-page .qs-passed,html[data-theme="dark"] .qbx-rs-page .qs-tile-passed .qs-v{color:#57d977}
 html[data-theme="dark"] .qbx-rs-page .qs-failed,html[data-theme="dark"] .qbx-rs-page .qs-tile-failed .qs-v{color:#ff7b72}
 html[data-theme="dark"] .qbx-rs-page .qs-broken,html[data-theme="dark"] .qbx-rs-page .qs-tile-broken .qs-v{color:#f0b35a}
-html[data-theme="dark"] .qbx-rs-page .qs-skipped,html[data-theme="dark"] .qbx-rs-page .qs-tile-skipped .qs-v{color:#a0a8b1}
+html[data-theme="dark"] .qbx-rs-page .qs-skipped,html[data-theme="dark"] .qbx-rs-page .qs-tile-skipped .qs-v{color:#a0a8b1}`;
+// Only for the page embedded in Allure: its own scroll area filling Allure's content pane.
+const RUN_SUMMARY_EMBED_CSS = `/* Its own scroll area filling Allure's content pane: the pane only scrolls when its
+   child stays within it, so a long page grew the pane and got clipped (no scroll). */
+.qbx-rs-page{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;box-sizing:border-box;padding:24px 32px 48px;font-size:13px;line-height:1.45;color:inherit}`;
+function renderRunSummaryPage(summary) {
+  const t = summary.totals;
+  const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  const num = (value, kind) => `<td class="qs-n${value && kind ? ` qs-${kind}` : ''}">${value}</td>`;
+  const countCells = row => num(row.testCases) + num(row.passed, 'passed') + num(row.failed, 'failed') +
+    num(row.broken, 'broken') + num(row.skipped, 'skipped');
+  const countHead = '<th class="qs-n">Test cases</th><th class="qs-n">Passed</th><th class="qs-n">Failed</th><th class="qs-n">Broken</th><th class="qs-n">Skipped</th>';
+  const moduleRows = summary.modules.map(row => `<tr><td>${escapeHtml(row.module)}</td><td>${escapeHtml(row.suite || '-')}</td>` +
+    `${num(row.specFiles)}${countCells(row)}</tr>`).join('');
+  const specRows = summary.specs.map(row => `<tr><td class="qs-code">${escapeHtml(row.spec)}</td><td>${escapeHtml(row.module)}</td>` +
+    `${countCells(row)}</tr>`).join('');
+  const failureRows = summary.failures.map((row, index) => `<tr><td class="qs-n">${index + 1}</td>` +
+    `<td class="qs-key">${escapeHtml(row.testCaseKey || '-')}</td><td>${escapeHtml(row.test)}</td><td>${escapeHtml(row.module)}</td>` +
+    `<td class="qs-code">${escapeHtml(row.spec)}</td><td class="qs-${row.status}">${escapeHtml(row.status)}</td>` +
+    `<td class="qs-msg">${escapeHtml(row.message || '-')}</td></tr>`).join('');
+  const tile = (label, value, kind = '') => `<div class="qs-tile${kind ? ` qs-tile-${kind}` : ''}"><div class="qs-v">${value}</div><div class="qs-l">${label}</div></div>`;
+  const table = (head, rows) => `<div class="qs-scroll"><table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  // The page itself: shown in Allure's content area when the menu item is chosen.
+  const page = `<div class="qbx-rs-page">
+<h2 class="qs-title">Run summary</h2>
+<div class="qs-sub">${plural(t.modules, 'module')}, ${plural(t.specFiles, 'spec file')}, ${plural(t.testCases, 'test case')} &middot; a retried test counts once, by its last attempt</div>
+<div class="qs-tiles">${tile('Spec files', t.specFiles)}${tile('Test cases', t.testCases)}${tile('Modules', t.modules)}${tile('Passed', t.passed, 'passed')}${tile('Failed', t.failed, 'failed')}${tile('Broken', t.broken, 'broken')}${tile('Skipped', t.skipped, 'skipped')}</div>
+${renderRunCharts(summary)}
+<h3>By module</h3>
+${table(`<th>Module</th><th>Suite</th><th class="qs-n">Spec files</th>${countHead}`, moduleRows)}
+<h3>By spec file</h3>
+${table(`<th>Spec file</th><th>Module</th>${countHead}`, specRows)}
+<h3>Failures (${summary.failures.length})</h3>
+${summary.failures.length
+    ? table('<th class="qs-n">#</th><th>Test case id</th><th>Test</th><th>Module</th><th>Spec file</th><th>Status</th><th>Error</th>', failureRows)
+    : '<div class="qs-none">No failures in this run.</div>'}
+<div class="qs-tip" role="tooltip" hidden></div>
+</div>`;
+  return page;
+}
+
+// A complete page for Jenkins's strict policy on published reports. Jenkins sends
+//   sandbox; default-src 'none'; img-src 'self'; style-src 'self';
+// which blocks every script, every inline style, and (the sandbox makes the page's
+// origin opaque, so 'self' matches nothing) even a stylesheet next to the page.
+// What it does not govern: plain HTML and SVG attributes and the browser's own default
+// styling. So this page uses only those: border / bgcolor / <font color> on elements,
+// fill= / stroke= on the SVG bars. No <script>, no <style>, no style=, no CSS file.
+const PLAIN_STATUS_COLOURS = { failed: '#d03b3b', broken: '#fab219', passed: '#0ca30c', skipped: '#8c959f' };
+const PLAIN_TEXT_COLOURS = { passed: '#1a7f37', failed: '#cf222e', broken: '#b35900', skipped: '#6e7781' };
+
+function plainCharts(summary) {
+  let html = renderRunCharts(summary);
+  // The chart marks keep their text tooltips as <title>; the scripted tooltip is not used.
+  html = html.replace(/(<g class="qs-mark"[^>]*data-tip="([^"]*)"[^>]*>)/g, '$1<title>$2</title>');
+  html = html
+    .replace(/<div class="qs-chart-title">([\s\S]*?)<\/div>/g, '<h3>$1</h3>')
+    .replace(/<div class="qs-legend">([\s\S]*?)<\/div>/g, (_m, inner) => `<p>${inner}</p>`)
+    .replace(/<span class="qs-key-item"><span class="qs-swatch qs-f-(\w+)"><\/span>([^<]*)<\/span>/g,
+      (_m, key, label) => `<font color="${PLAIN_STATUS_COLOURS[key]}">&#9632;</font> ${label}&nbsp;&nbsp;&nbsp;`)
+    .replace(/<div class="qs-note">([\s\S]*?)<\/div>/g, '<p><i>$1</i></p>')
+    .replace(/<div class="qs-none">([\s\S]*?)<\/div>/g, '<p>$1</p>')
+    .replace(/<div class="qs-charts?">/g, '<div>');
+  // SVG: size as attributes, colours as presentation attributes.
+  html = html.replace(/<svg class="qs-svg" viewBox="0 0 (\d+) (\d+)"/g, '<svg width="$1" height="$2" viewBox="0 0 $1 $2" overflow="visible"');
+  for (const [key, colour] of Object.entries(PLAIN_STATUS_COLOURS)) {
+    html = html.split(`class="qs-f-${key}"`).join(`fill="${colour}"`);
+    html = html.split(`class="qs-in qs-in-${key}"`).join(`font-size="13" font-weight="bold" fill="${key === 'broken' || key === 'skipped' ? '#0b0b0b' : '#ffffff'}"`);
+  }
+  return html
+    .split('class="qs-grid"').join('stroke="#d0d7de" stroke-width="1"')
+    .split('class="qs-tick"').join('font-size="11" fill="#6e7781"')
+    .split('class="qs-cat"').join('font-size="12" fill="#1f2328"')
+    .split('class="qs-val"').join('font-size="12" font-weight="bold" fill="#1f2328"')
+    .split('class="qs-mark" tabindex="0" ').join('tabindex="0" ');
+}
+
+function renderPlainRunSummary(summary) {
+  const t = summary.totals;
+  const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  const coloured = (value, key) => (value ? `<font color="${PLAIN_TEXT_COLOURS[key]}"><b>${value}</b></font>` : `${value}`);
+  const countCells = row => `<td align="right">${row.testCases}</td><td align="right">${coloured(row.passed, 'passed')}</td>` +
+    `<td align="right">${coloured(row.failed, 'failed')}</td><td align="right">${coloured(row.broken, 'broken')}</td>` +
+    `<td align="right">${row.skipped}</td>`;
+  const countHead = ['Test cases', 'Passed', 'Failed', 'Broken', 'Skipped'].map(h => `<th align="right" bgcolor="#eef1f4">${h}</th>`).join('');
+  const th = text => `<th align="left" bgcolor="#eef1f4">${text}</th>`;
+  const table = (head, rows) => `<table border="1" cellspacing="0" cellpadding="6" width="100%"><tr>${head}</tr>${rows}</table>`;
+  const tile = (label, value, key) => `<td align="center" width="110"><font size="6"><b>${key ? `<font color="${PLAIN_TEXT_COLOURS[key]}">${value}</font>` : value}</b></font><br>` +
+    `<font size="2" color="#59636e">${label}</font></td>`;
+  const moduleRows = summary.modules.map(row => `<tr><td>${escapeHtml(row.module)}</td><td>${escapeHtml(row.suite || '-')}</td>` +
+    `<td align="right">${row.specFiles}</td>${countCells(row)}</tr>`).join('');
+  const specRows = summary.specs.map(row => `<tr><td><code>${escapeHtml(row.spec)}</code></td><td>${escapeHtml(row.module)}</td>${countCells(row)}</tr>`).join('');
+  const failureRows = summary.failures.map((row, index) => `<tr><td align="right">${index + 1}</td><td nowrap>${escapeHtml(row.testCaseKey || '-')}</td>` +
+    `<td>${escapeHtml(row.test)}</td><td>${escapeHtml(row.module)}</td><td><code>${escapeHtml(row.spec)}</code></td>` +
+    `<td><font color="${PLAIN_TEXT_COLOURS[row.status] || '#1f2328'}"><b>${escapeHtml(row.status)}</b></font></td>` +
+    `<td><code>${escapeHtml(row.message || '-')}</code></td></tr>`).join('');
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run summary - Allure Report</title></head>
+<body bgcolor="#ffffff" text="#1f2328" link="#0969da" vlink="#0969da">
+<p><a href="index.html">&larr; Allure report</a> (it needs scripts: it stays blank where the server blocks them, as Jenkins does by default)</p>
+<h1>Run summary</h1>
+<p><font color="#59636e">${plural(t.modules, 'module')}, ${plural(t.specFiles, 'spec file')}, ${plural(t.testCases, 'test case')} &middot; a retried test counts once, by its last attempt</font></p>
+<table border="1" cellspacing="0" cellpadding="10"><tr>${tile('Spec files', t.specFiles)}${tile('Test cases', t.testCases)}${tile('Modules', t.modules)}${tile('Passed', t.passed, 'passed')}${tile('Failed', t.failed, 'failed')}${tile('Broken', t.broken, 'broken')}${tile('Skipped', t.skipped, 'skipped')}</tr></table>
+${plainCharts(summary)}
+<h2>By module</h2>
+${table(`${th('Module')}${th('Suite')}<th align="right" bgcolor="#eef1f4">Spec files</th>${countHead}`, moduleRows)}
+<h2>By spec file</h2>
+${table(`${th('Spec file')}${th('Module')}${countHead}`, specRows)}
+<h2>Failures (${summary.failures.length})</h2>
+${summary.failures.length ? table(`<th align="right" bgcolor="#eef1f4">#</th>${th('Test case id')}${th('Test')}${th('Module')}${th('Spec file')}${th('Status')}${th('Error')}`, failureRows) : '<p>No failures in this run.</p>'}
+</body></html>
+`;
+}
+
+function renderRunSummary(summary) {
+  const page = renderRunSummaryPage(summary);
+  // A menu entry like Overview / Categories / Suites. Allure rebuilds its menu on
+  // every tab switch, so the entry is put back whenever the menu is drawn again.
+  // Its route (#run-summary) is unknown to Allure, which shows "Not found" there:
+  // the summary page takes that place, and leaves when another tab is chosen.
+  return `
+<div id="qbx-run-summary" data-generated="${escapeHtml(summary.generatedAt)}">
+<style>
+${RUN_SUMMARY_CSS}${RUN_SUMMARY_EMBED_CSS}
 </style>
 <template id="qbx-run-summary-page">${page}</template>
 <script>(function(){
@@ -553,6 +637,8 @@ function addRunSummary(reportFolder, resultsDir) {
   const block = renderRunSummary(summary);
   const updated = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, `${block}\n</body>`) : `${html}${block}`;
   fs.writeFileSync(indexPath, updated, 'utf8');
+  // The same page as plain HTML with no script, style or stylesheet, for Jenkins's strict policy on published reports.
+  fs.writeFileSync(path.join(reportFolder, 'run-summary.html'), renderPlainRunSummary(summary), 'utf8');
   return summary;
 }
 
