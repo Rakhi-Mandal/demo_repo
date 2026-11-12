@@ -729,6 +729,27 @@ function countsLine(row) {
     `${row.broken} broken, ${row.skipped} skipped`;
 }
 
+// How Jenkins's HTML Publisher puts a report name into its address: every character
+// other than a letter or digit becomes "_" + its hex code ("Qualibrix Run Summary" ->
+// "Qualibrix_20Run_20Summary", "Allure Report (Qualibrix)" -> "Allure_20Report_20_28Qualibrix_29").
+function publishedReportUrlName(reportName) {
+  return String(reportName).replace(/[^A-Za-z0-9]/g, ch => `_${ch.charCodeAt(0).toString(16)}`);
+}
+
+// Where the plain Run summary page is published on the Jenkins build page, so the Jenkins
+// Allure plugin's report can link to it (its Environment panel makes a URL clickable).
+// QUALIBRIX_RUN_SUMMARY_URL overrides the whole address; QUALIBRIX_RUN_SUMMARY_REPORT_NAME
+// is the publishHTML reportName in the Jenkinsfile (default "Qualibrix Run Summary").
+// Empty outside Jenkins, where the page sits next to the report and needs no link.
+function runSummaryUrl(env = process.env) {
+  const given = String(env.QUALIBRIX_RUN_SUMMARY_URL || '').trim();
+  if (given) return given;
+  const buildUrl = String(env.BUILD_URL || '').trim();
+  if (!buildUrl) return '';
+  const name = String(env.QUALIBRIX_RUN_SUMMARY_REPORT_NAME || 'Qualibrix Run Summary').trim();
+  return `${buildUrl.endsWith('/') ? buildUrl : `${buildUrl}/`}${publishedReportUrlName(name)}/run-summary.html`;
+}
+
 // Adds (or refreshes) the Qualibrix lines in dir/environment.properties; every other line stays.
 function mergeEnvironment(dir, summary) {
   const file = path.join(dir, 'environment.properties');
@@ -737,7 +758,9 @@ function mergeEnvironment(dir, summary) {
     kept = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(line => line.trim() !== '' && !line.startsWith(ENV_PREFIX));
   } catch (_) {}
   const t = summary.totals;
+  const link = runSummaryUrl();
   const ours = [
+    ...(link ? [`${ENV_PREFIX}RunSummary=${link}`] : []),
     `${ENV_PREFIX}SpecFiles=${t.specFiles}`,
     `${ENV_PREFIX}Modules=${t.modules}`,
     `${ENV_PREFIX}TestCases=${t.testCases}`,
@@ -750,12 +773,57 @@ function mergeEnvironment(dir, summary) {
   fs.writeFileSync(file, `${[...kept, ...ours].join('\n')}\n`, 'utf8');
 }
 
+// Categories tab / Overview "Categories" widget: failed and broken test cases grouped by
+// module. A category matches on the stack trace, which carries the spec file's path
+// (".../sanity/orders/orders.spec.js:3:50"), so no test result has to be changed.
+// Ours go first (the first matching category wins); Allure's usual categories follow, so
+// skipped tests and failures outside a module land where they always did. Categories you
+// already have in categories.json are kept. QUALIBRIX_MODULE_CATEGORIES=off turns this off.
+const CATEGORY_PREFIX = 'Qualibrix: ';
+const ALLURE_DEFAULT_CATEGORIES = [
+  { name: 'Ignored tests', matchedStatuses: ['skipped'] },
+  { name: 'Infrastructure problems', matchedStatuses: ['broken', 'failed'], messageRegex: '.*bye-bye.*' },
+  { name: 'Outdated tests', matchedStatuses: ['broken'], traceRegex: '.*FileNotFoundException.*' },
+  { name: 'Product defects', matchedStatuses: ['failed'] },
+  { name: 'Test defects', matchedStatuses: ['broken'] },
+];
+
+function moduleTraceRegex(moduleName) {
+  // [\\/] is "backslash or slash" (Windows and Linux paths); [\s\S] instead of "." so the
+  // match does not depend on the engine's dot-matches-newline setting.
+  const sep = String.raw`[\\/]`;
+  const suite = `${sep}(?:sanity|regression)${sep}`;
+  if (moduleName === 'Root') return String.raw`[\s\S]*${suite}[^\\/\s:]+\.(?:spec|test)\.[cm]?[jt]sx?[\s\S]*`;
+  const escaped = String(moduleName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return `[\\s\\S]*${suite}${escaped}${sep}[\\s\\S]*`;
+}
+
+function mergeCategories(dir, summary) {
+  if (/^(0|false|off|no)$/i.test(String(process.env.QUALIBRIX_MODULE_CATEGORIES || '').trim())) return 0;
+  const file = path.join(dir, 'categories.json');
+  let existing = null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
+    if (Array.isArray(parsed)) existing = parsed.filter(item => item && !String(item.name || '').startsWith(CATEGORY_PREFIX));
+  } catch (_) {}
+  const base = existing && existing.length ? existing : ALLURE_DEFAULT_CATEGORIES;
+  const ours = summary.modules.filter(row => row.failed + row.broken > 0).map(row => ({
+    name: `${CATEGORY_PREFIX}failures in ${row.module}`,
+    description: `Failed and broken test cases in module "${row.module}" (${row.failed} failed, ${row.broken} broken).`,
+    matchedStatuses: ['failed', 'broken'],
+    traceRegex: moduleTraceRegex(row.module),
+  }));
+  fs.writeFileSync(file, `${JSON.stringify([...ours, ...base], null, 2)}\n`, 'utf8');
+  return ours.length;
+}
+
 // All of the above, on one results folder. Safe to run more than once.
 function customizeResultsDir(dir, healLogPath) {
   groupResultsByModule(dir);
   addHealedLocators(dir, healLogPath);
   const summary = summarizeResults(dir);
   mergeEnvironment(dir, summary);
+  mergeCategories(dir, summary);
   return summary;
 }
 
@@ -832,8 +900,11 @@ class AllureHtmlReporter {
     }
     const summary = summarizeResults(staging);
     mergeEnvironment(this.resultsDir, summary);
-    // The reporter's own report shows the same Environment lines.
-    fs.copyFileSync(path.join(this.resultsDir, 'environment.properties'), path.join(staging, 'environment.properties'));
+    mergeCategories(this.resultsDir, summary);
+    // The reporter's own report shows the same Environment lines and categories.
+    for (const name of ['environment.properties', 'categories.json']) {
+      if (fs.existsSync(path.join(this.resultsDir, name))) fs.copyFileSync(path.join(this.resultsDir, name), path.join(staging, name));
+    }
     console.log(`[allure-html] Customizations written to ${this.resultsDir} (${copied} result file(s), environment.properties)`);
   }
 
@@ -847,12 +918,7 @@ class AllureHtmlReporter {
 
   // The project's own Allure 3 (devDependency 'allure'), else the pinned one via npx.
   generator() {
-    try {
-      const entry = require.resolve('allure', { paths: [process.cwd(), __dirname] });
-      return { command: process.execPath, args: [path.join(path.dirname(entry), '..', 'cli.js')], shell: false };
-    } catch (_) {
-      return { command: 'npx', args: ['--yes', `allure@${ALLURE_VERSION}`], shell: true };
-    }
+    return allureGenerator();
   }
 
   generate() {
@@ -862,42 +928,135 @@ class AllureHtmlReporter {
       return;
     }
     try {
-      // Allure 3 has no --clean: a previous report must not leave files behind.
-      fs.rmSync(this.outputFolder, { recursive: true, force: true });
       try {
         console.log(`[allure-html] Executor: ${stageExecutor(staging, this.resultsDir, this.outputFolder)}`);
       } catch (error) {
         console.log(`[allure-html] Executor details not added: ${error.message}`);
       }
-      const config = path.join(staging, 'allurerc.json');
-      fs.writeFileSync(config, JSON.stringify(REPORT_CONFIG));
-      const { command, args, shell } = this.generator();
-      const all = [...args, 'generate', staging, '-o', this.outputFolder, '--config', config];
-      // Through a shell (npx), every argument is quoted: paths may contain spaces.
-      const run = spawnSync(command, shell ? all.map(arg => `"${arg}"`) : all,
-        { encoding: 'utf8', shell, timeout: 300000, windowsHide: true });
-      const index = path.join(this.outputFolder, 'index.html');
-      if (run.status === 0 && fs.existsSync(index)) {
-        hideFeaturesByStoriesWidget(this.outputFolder);
-        try {
-          const summary = addRunSummary(this.outputFolder, staging);
-          if (summary) {
-            const t = summary.totals;
-            console.log(`[allure-html] Run summary: ${t.specFiles} spec file(s), ${t.testCases} test case(s) in ${t.modules} module(s); ` +
-              `${t.passed} passed, ${t.failed} failed, ${t.broken} broken, ${t.skipped} skipped`);
-          }
-        } catch (error) {
-          console.log(`[allure-html] Run summary not added to the report: ${error.message}`);
-        }
+      const built = buildClassicReport(staging, this.outputFolder);
+      if (built.ok) {
+        if (built.summary) console.log(`[allure-html] Run summary: ${summaryLine(built.summary)}`);
+        if (built.summaryError) console.log(`[allure-html] Run summary not added to the report: ${built.summaryError}`);
         this.persistHistory();
-        console.log(`[allure-html] Allure report: ${index}`);
+        console.log(`[allure-html] Allure report: ${built.index}`);
       } else {
-        const why = run.error ? run.error.message : `exit ${run.status}`;
-        console.log(`[allure-html] Allure report not generated (${why}): ${String(run.stderr || run.stdout || '').trim().slice(-800)}`);
+        console.log(`[allure-html] Allure report not generated (${built.error})`);
       }
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
     }
+  }
+}
+
+// The project's own Allure 3 (devDependency 'allure'), else the pinned one via npx.
+function allureGenerator() {
+  try {
+    const entry = require.resolve('allure', { paths: [process.cwd(), __dirname] });
+    return { command: process.execPath, args: [path.join(path.dirname(entry), '..', 'cli.js')], shell: false };
+  } catch (_) {
+    return { command: 'npx', args: ['--yes', `allure@${ALLURE_VERSION}`], shell: true };
+  }
+}
+
+function summaryLine(summary) {
+  const t = summary.totals;
+  return `${t.specFiles} spec file(s), ${t.testCases} test case(s) in ${t.modules} module(s); ` +
+    `${t.passed} passed, ${t.failed} failed, ${t.broken} broken, ${t.skipped} skipped`;
+}
+
+// Builds the Qualibrix report from an already customized results folder: the classic
+// Allure layout, the "Features by stories" box hidden, and the Run summary menu page
+// (plus run-summary.html / run-summary.json next to index.html). Used by the reporter at
+// the end of a test run and by the Jenkins Allure plugin through --allure-commandline.
+function buildClassicReport(staging, outputFolder, { singleFile = false } = {}) {
+  // Allure 3 has no --clean: a previous report must not leave files behind.
+  fs.rmSync(outputFolder, { recursive: true, force: true });
+  const config = path.join(staging, 'allurerc.json');
+  const reportConfig = singleFile
+    ? { ...REPORT_CONFIG, plugins: { allure2: { options: { singleFile: true } } } }
+    : REPORT_CONFIG;
+  fs.writeFileSync(config, JSON.stringify(reportConfig));
+  try {
+    const { command, args, shell } = allureGenerator();
+    const all = [...args, 'generate', staging, '-o', outputFolder, '--config', config];
+    // Through a shell (npx), every argument is quoted: paths may contain spaces.
+    const run = spawnSync(command, shell ? all.map(arg => `"${arg}"`) : all,
+      { encoding: 'utf8', shell, timeout: 300000, windowsHide: true });
+    const index = path.join(outputFolder, 'index.html');
+    if (run.status !== 0 || !fs.existsSync(index)) {
+      const why = run.error ? run.error.message : `exit ${run.status}`;
+      return { ok: false, error: `${why}: ${String(run.stderr || run.stdout || '').trim().slice(-800)}` };
+    }
+    hideFeaturesByStoriesWidget(outputFolder);
+    try {
+      return { ok: true, index, summary: addRunSummary(outputFolder, staging) };
+    } catch (error) {
+      return { ok: true, index, summary: null, summaryError: error.message };
+    }
+  } finally {
+    fs.rmSync(config, { force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Acting as the Allure commandline for the Jenkins Allure plugin, so the plugin's own
+// report is this Qualibrix report (Run summary menu page after Overview, modules,
+// healed-locator blocks, per-module categories). The plugin runs, in the workspace:
+//   allure --version
+//   allure generate <results...> [-c] -o <report> [--config <file>] [--single-file]
+// through the small wrapper in bin/allure (bin/allure.bat on Windows) of a Jenkins tool
+// installation; see docs/Jenkinsfile.updated. The plugin has already written
+// executor.json and the previous build's history into the results; both are used.
+// ---------------------------------------------------------------------------
+function runAsAllureCommandline(args) {
+  const [command, ...rest] = args;
+  if (['--version', '-v', 'version'].includes(command)) {
+    // Read by the plugin as "major version 3": it then passes Allure 3 arguments.
+    console.log(ALLURE_VERSION);
+    return 0;
+  }
+  if (command !== 'generate') {
+    console.error(`[qualibrix-allure] Only "generate" and "--version" are supported, got: ${args.join(' ')}`);
+    return 2;
+  }
+  const resultsDirs = [];
+  let output = null;
+  let singleFile = false;
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i];
+    if (arg === '-o' || arg === '--output' || arg === '--report-dir') output = rest[++i];
+    else if (arg === '--single-file') singleFile = true;
+    else if (arg === '-c' || arg === '--clean') continue;            // always a clean build
+    else if (['--config', '--profile', '--name', '--lang', '--report-name'].includes(arg)) i += 1;  // not used
+    else if (arg.startsWith('-')) continue;
+    else resultsDirs.push(arg);
+  }
+  if (!output || !resultsDirs.length) {
+    console.error('[qualibrix-allure] Usage: allure generate <results...> -o <report>');
+    return 2;
+  }
+  const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'qualibrix-allure-'));
+  try {
+    for (const dir of resultsDirs) {
+      if (fs.existsSync(dir)) fs.cpSync(path.resolve(dir), staging, { recursive: true, force: true });
+      else console.log(`[qualibrix-allure] Results folder not found, skipped: ${dir}`);
+    }
+    const summary = customizeResultsDir(staging, path.resolve(process.cwd(), 'test-results', 'inline_heals.json'));
+    console.log(`[qualibrix-allure] Executor: ${stageExecutor(staging, path.resolve(resultsDirs[0]), path.resolve(output))}`);
+    const built = buildClassicReport(staging, path.resolve(output), { singleFile });
+    if (!built.ok) {
+      console.error(`[qualibrix-allure] Report not generated (${built.error})`);
+      return 1;
+    }
+    console.log(`[qualibrix-allure] Run summary: ${summaryLine(built.summary || summary)}`);
+    if (built.summaryError) console.log(`[qualibrix-allure] Run summary page not added: ${built.summaryError}`);
+    console.log(`[qualibrix-allure] Report successfully generated to ${path.resolve(output)}`);
+    return 0;
+  } catch (error) {
+    console.error(`[qualibrix-allure] Report not generated: ${error.message}`);
+    return 1;
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
   }
 }
 
@@ -906,9 +1065,12 @@ module.exports = AllureHtmlReporter;
 // Command line (the Jenkinsfile runs this just before the Allure plugin step, so the
 // plugin's report has the customizations whatever else wrote to allure-results):
 //   node fixtures/allure_html_reporter.js --customize-results [allure-results]
+//   node fixtures/allure_html_reporter.js --allure-commandline <allure arguments>
 if (require.main === module) {
   const [flag, folder] = process.argv.slice(2);
-  if (flag === '--customize-results') {
+  if (flag === '--allure-commandline') {
+    process.exitCode = runAsAllureCommandline(process.argv.slice(3));
+  } else if (flag === '--customize-results') {
     const dir = path.resolve(folder || 'allure-results');
     if (!fs.existsSync(dir)) {
       console.log(`[allure-html] ${dir} does not exist; nothing to customize.`);
